@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <title>Catrion Line</title>
+
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div id="appShell" class="app-shell">
+
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="line-logo-top">LINE</div>
+      </div>
+
+      <div class="topbar-center">
+        <div class="client-logo-placeholder">
+          LOGO CLIENTE
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <div class="user-chip">
+          <div class="user-avatar">G</div>
+          <div class="user-info">
+            <strong>Gustavo</strong>
+            <span>DEV</span>
+          </div>
+        </div>
+
+        <button class="logout-btn">Sair</button>
+      </div>
+    </header>
+
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-top">
+        <button id="pinSidebarBtn" class="sidebar-pin" title="Fixar menu">📌</button>
+      </div>
+
+      <nav class="sidebar-nav">
+        <button class="nav-item active" data-page="dashboard">
+          <span class="nav-icon">🏭</span>
+          <span class="nav-label">Dashboard</span>
+        </button>
+
+        <button class="nav-item" data-page="cadastros">
+          <span class="nav-icon">🗂️</span>
+          <span class="nav-label">Cadastros</span>
+        </button>
+
+        <button class="nav-item" data-page="estoque">
+          <span class="nav-icon">🏷️</span>
+          <span class="nav-label">Estoque</span>
+        </button>
+
+        <button class="nav-item" data-page="producao">
+          <span class="nav-icon">⚙️</span>
+          <span class="nav-label">Produção</span>
+        </button>
+
+        <button class="nav-item" data-page="movimentacoes">
+          <span class="nav-icon">🔁</span>
+          <span class="nav-label">Movimentações</span>
+        </button>
+
+        <button class="nav-item" data-page="calculos">
+          <span class="nav-icon">📐</span>
+          <span class="nav-label">Cálculos PCP</span>
+        </button>
+
+        <button class="nav-item" data-page="rastreabilidade">
+          <span class="nav-icon">🔎</span>
+          <span class="nav-label">Rastreabilidade</span>
+        </button>
+
+        <button class="nav-item" data-page="relatorios">
+          <span class="nav-icon">📈</span>
+          <span class="nav-label">Relatórios</span>
+        </button>
+
+        <button class="nav-item" data-page="laboratorio">
+          <span class="nav-icon">🧪</span>
+          <span class="nav-label">Laboratório</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-bottom">
+        <button class="nav-item" data-page="acessos">
+          <span class="nav-icon">👥</span>
+          <span class="nav-label">Gestão de Acessos</span>
+        </button>
+      </div>
+
+      <div class="sidebar-footer">
+        <span>Developed by</span>
+        <strong>Catrion</strong>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <section id="appContent" class="content"></section>
+    </main>
+  </div>
+
+   <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
