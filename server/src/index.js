@@ -9,6 +9,7 @@ const machinesRoutes = require("./routes/machines.routes");
 const operatorsRoutes = require("./routes/operators.routes");
 const operatorRolesRoutes = require("./routes/operator-roles.routes");
 const suppliersRoutes = require("./routes/suppliers.routes");
+const technicalParametersRoutes = require("./routes/technical-parameters.routes");
 
 dotenv.config();
 
@@ -27,6 +28,7 @@ app.use("/api/machines", machinesRoutes);
 app.use("/api/operators", operatorsRoutes);
 app.use("/api/operator-roles", operatorRolesRoutes);
 app.use("/api/suppliers", suppliersRoutes);
+app.use("/api/technical-parameters", technicalParametersRoutes);
 
 app.listen(port, () => {
   console.log(`Catrion Line API running on http://localhost:${port}`);
