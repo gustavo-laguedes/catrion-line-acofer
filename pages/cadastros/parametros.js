@@ -1,6 +1,9 @@
 import { lineStore, getMaterialOptions, unitOptions } from "../../shared/data-store.js";
+import { apiDelete, apiGet, apiPost, apiPut } from "../../shared/api-client.js";
 
 const technicalParameters = lineStore.technicalParameters;
+let hasTriedApiLoad = false;
+let hasTriedMaterialLoad = false;
 
 /*
 const unitOptions = [
@@ -524,6 +527,9 @@ function renderSelectOptions(options, selectedValue = "") {
 }
 
 function setupParametrosEvents() {
+  loadParameterMaterialsFromApi();
+  loadTechnicalParametersFromApi();
+
   const modal = document.getElementById("parameterModal");
   const openBtn = document.getElementById("openParameterModalBtn");
   const openEmptyBtn = document.getElementById("openParameterModalEmptyBtn");
@@ -568,7 +574,7 @@ toleranceInputs.forEach((input) => {
   });
 });
 
-  saveBtn?.addEventListener("click", () => {
+  saveBtn?.addEventListener("click", async () => {
     const name = document.getElementById("parameterNameInput").value.trim();
     const code = document.getElementById("parameterCodeInput").value.trim().toUpperCase();
     const material = document.getElementById("parameterMaterialInput").value;
@@ -585,7 +591,7 @@ const maxToleranceNumber = document.getElementById("parameterMaxToleranceNumberI
       return;
     }
 
-    technicalParameters.push({
+    const savedParameter = await createTechnicalParameter({
       name,
       code,
       material,
@@ -599,6 +605,10 @@ maxToleranceNumber,
       notes,
       status: "Ativo"
     });
+
+    if (!savedParameter) return;
+
+    technicalParameters.push(savedParameter);
 
     modal.classList.remove("open");
     rerenderParametros();
@@ -628,21 +638,28 @@ rerenderParametros();
     rerenderParametros();
   });
 
-  saveEditBtn?.addEventListener("click", () => {
+  saveEditBtn?.addEventListener("click", async () => {
     const parameter = technicalParameters[selectedParameterIndex];
 
-    parameter.name = document.getElementById("editParameterNameInput").value.trim();
-    parameter.code = document.getElementById("editParameterCodeInput").value.trim().toUpperCase();
-    parameter.material = document.getElementById("editParameterMaterialInput").value;
-    parameter.unit = document.getElementById("editParameterUnitInput").value;
-    parameter.baseValue = document.getElementById("editParameterBaseValueInput").value.trim();
-    parameter.toleranceMode = toleranceMode;
-parameter.minTolerancePercent = document.getElementById("editParameterMinTolerancePercentInput").value.trim();
-parameter.minToleranceNumber = document.getElementById("editParameterMinToleranceNumberInput").value.trim();
-parameter.maxTolerancePercent = document.getElementById("editParameterMaxTolerancePercentInput").value.trim();
-parameter.maxToleranceNumber = document.getElementById("editParameterMaxToleranceNumberInput").value.trim();
-    parameter.status = document.getElementById("editParameterStatusInput").value;
-    parameter.notes = document.getElementById("editParameterNotesInput").value.trim();
+    const updatedParameter = await updateTechnicalParameter(parameter, {
+      ...parameter,
+      name: document.getElementById("editParameterNameInput").value.trim(),
+      code: document.getElementById("editParameterCodeInput").value.trim().toUpperCase(),
+      material: document.getElementById("editParameterMaterialInput").value,
+      unit: document.getElementById("editParameterUnitInput").value,
+      baseValue: document.getElementById("editParameterBaseValueInput").value.trim(),
+      toleranceMode,
+      minTolerancePercent: document.getElementById("editParameterMinTolerancePercentInput").value.trim(),
+      minToleranceNumber: document.getElementById("editParameterMinToleranceNumberInput").value.trim(),
+      maxTolerancePercent: document.getElementById("editParameterMaxTolerancePercentInput").value.trim(),
+      maxToleranceNumber: document.getElementById("editParameterMaxToleranceNumberInput").value.trim(),
+      status: document.getElementById("editParameterStatusInput").value,
+      notes: document.getElementById("editParameterNotesInput").value.trim()
+    });
+
+    if (!updatedParameter) return;
+
+    technicalParameters[selectedParameterIndex] = updatedParameter;
 
     isEditingParameter = false;
     rerenderParametros();
@@ -666,7 +683,11 @@ parameter.maxToleranceNumber = document.getElementById("editParameterMaxToleranc
     confirmDeleteBtn.disabled = !deleteAwareInput.checked;
   });
 
-  confirmDeleteBtn?.addEventListener("click", () => {
+  confirmDeleteBtn?.addEventListener("click", async () => {
+    const deletedParameter = await deleteTechnicalParameter(technicalParameters[selectedParameterIndex]);
+
+    if (!deletedParameter) return;
+
     technicalParameters.splice(selectedParameterIndex, 1);
 
     selectedParameterIndex = null;
@@ -679,6 +700,138 @@ parameter.maxToleranceNumber = document.getElementById("editParameterMaxToleranc
   modal?.addEventListener("click", (event) => {
     if (event.target === modal) modal.classList.remove("open");
   });
+}
+
+async function loadParameterMaterialsFromApi() {
+  if (hasTriedMaterialLoad) return;
+
+  hasTriedMaterialLoad = true;
+
+  try {
+    const apiMaterials = await apiGet("/api/materials");
+    lineStore.materials.splice(0, lineStore.materials.length, ...apiMaterials.map(normalizeMaterial).filter(isActiveItem));
+    rerenderParametros();
+  } catch (error) {
+    console.log("API indisponivel, usando materiais locais");
+  }
+}
+
+async function loadTechnicalParametersFromApi() {
+  if (hasTriedApiLoad) return;
+
+  hasTriedApiLoad = true;
+
+  try {
+    const apiParameters = await apiGet("/api/technical-parameters");
+    technicalParameters.splice(0, technicalParameters.length, ...apiParameters.map(normalizeTechnicalParameter).filter(isActiveItem));
+    rerenderParametros();
+  } catch (error) {
+    console.log("API indisponivel, usando parametros locais");
+  }
+}
+
+async function createTechnicalParameter(payload) {
+  try {
+    const parameter = await apiPost("/api/technical-parameters", payload);
+    return normalizeTechnicalParameter(parameter);
+  } catch (error) {
+    if (!shouldUseLocalFallback(error)) {
+      alert(error.message);
+      return null;
+    }
+
+    console.log("API indisponivel, usando parametros locais");
+    return normalizeTechnicalParameter(payload);
+  }
+}
+
+async function updateTechnicalParameter(parameter, payload) {
+  if (!parameter.id) {
+    alert("Este parametro ainda nao possui ID da API. Recarregue os parametros da API antes de editar.");
+    return null;
+  }
+
+  try {
+    const updatedParameter = await apiPut(`/api/technical-parameters/${parameter.id}`, payload);
+    return normalizeTechnicalParameter(updatedParameter);
+  } catch (error) {
+    if (!shouldUseLocalFallback(error)) {
+      alert(error.message);
+      return null;
+    }
+
+    console.log("API indisponivel, usando parametros locais");
+    return normalizeTechnicalParameter({
+      ...parameter,
+      ...payload
+    });
+  }
+}
+
+async function deleteTechnicalParameter(parameter) {
+  if (!parameter.id) {
+    alert("Este parametro ainda nao possui ID da API. Recarregue os parametros da API antes de inativar.");
+    return null;
+  }
+
+  try {
+    const deletedParameter = await apiDelete(`/api/technical-parameters/${parameter.id}`);
+    return normalizeTechnicalParameter(deletedParameter);
+  } catch (error) {
+    if (!shouldUseLocalFallback(error)) {
+      alert(error.message);
+      return null;
+    }
+
+    console.log("API indisponivel, usando parametros locais");
+    return normalizeTechnicalParameter({
+      ...parameter,
+      status: "Inativo"
+    });
+  }
+}
+
+function normalizeTechnicalParameter(parameter) {
+  return {
+    id: parameter.id,
+    code: parameter.code || "",
+    name: parameter.name || "",
+    materialId: parameter.materialId || null,
+    material: parameter.material || getMaterialOptions()[0] || "Nao vincular material",
+    unit: parameter.unit || "un",
+    baseValue: formatDecimalValue(parameter.baseValue),
+    toleranceMode: parameter.toleranceMode || "percentual",
+    minTolerancePercent: formatDecimalValue(parameter.minTolerancePercent),
+    minToleranceNumber: formatDecimalValue(parameter.minToleranceNumber),
+    maxTolerancePercent: formatDecimalValue(parameter.maxTolerancePercent),
+    maxToleranceNumber: formatDecimalValue(parameter.maxToleranceNumber),
+    notes: parameter.notes || "",
+    status: parameter.status || "Ativo",
+    createdAt: parameter.createdAt,
+    updatedAt: parameter.updatedAt
+  };
+}
+
+function normalizeMaterial(material) {
+  return {
+    id: material.id,
+    code: material.code || "",
+    name: material.name || "",
+    status: material.status || "Ativo"
+  };
+}
+
+function formatDecimalValue(value) {
+  if (value === null || value === undefined || value === "") return "";
+  return String(value).replace(".", ",");
+}
+
+function shouldUseLocalFallback(error) {
+  return !error.status;
+}
+
+function isActiveItem(item) {
+  return item.status !== "Inativo";
 }
 
 function closeEditModal() {

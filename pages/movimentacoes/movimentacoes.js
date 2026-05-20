@@ -1,4 +1,5 @@
 import { lineStore, getActiveItems } from "../../shared/data-store.js";
+import { apiGet, apiPost } from "../../shared/api-client.js";
 import {
   movementTabs,
   getTabDescription,
@@ -104,6 +105,8 @@ let selectedMovementId = null;
 let isEditingMovement = false;
 let movementDeleteTargetId = null;
 let movementReprocessTargetId = null;
+let hasTriedPurchaseApiLoad = false;
+let hasTriedReferenceApiLoad = false;
 
 let movementHistoryFilters = {
   search: "",
@@ -1155,7 +1158,10 @@ function renderReprocessMovementModal() {
   `;
 }
 
-function setupMovimentacoesEvents() {
+function setupMovimentacoesEvents(options = {}) {
+  loadPurchaseReferencesFromApi();
+  loadPurchaseMovementsFromApi(Boolean(options.navigation));
+
   document.querySelectorAll("[data-movement-tab]").forEach((button) => {
     button.addEventListener("click", () => {
       activeMovementTab = button.dataset.movementTab;
@@ -1256,20 +1262,20 @@ refreshMovimentacoesPage();
     });
   });
 
-  document.getElementById("registerMovementBtn")?.addEventListener("click", () => {
+  document.getElementById("registerMovementBtn")?.addEventListener("click", async () => {
     const sourceType = activeMovementTab === "INVENTORY" && inventoryEntryMode === "IMPORT"
       ? "IMPORT"
       : "MANUAL";
 
-    registerMovement(activeMovementTab, sourceType);
+    await registerMovement(activeMovementTab, sourceType);
   });
 
   document.getElementById("downloadTemplateBtn")?.addEventListener("click", downloadImportTemplate);
 
   document.getElementById("previewImportBtn")?.addEventListener("click", previewImportFile);
 
-  document.getElementById("confirmImportBtn")?.addEventListener("click", () => {
-    registerMovement(activeMovementTab, "IMPORT");
+  document.getElementById("confirmImportBtn")?.addEventListener("click", async () => {
+    await registerMovement(activeMovementTab, "IMPORT");
   });
 
   document.getElementById("movementHistorySearch")?.addEventListener("input", (event) => {
@@ -1828,6 +1834,7 @@ captureMovementFormState();
 
   const draftItem = {
     id: crypto.randomUUID(),
+    materialId: material?.id || "",
     materialName,
     materialCode: material?.code || material?.materialCode || "-",
     quantity,
@@ -1947,7 +1954,7 @@ function validateManualSecondaryLots(items, type) {
   return { valid: true };
 }
 
-function registerMovement(type, sourceType) {
+async function registerMovement(type, sourceType) {
   const items = sourceType === "IMPORT" ? importPreviewItems : movementDraftItems;
 
   if (!items.length) {
@@ -2052,80 +2059,148 @@ if (type === "TRANSFER") {
 
   const movement = buildMovementHeader(type, sourceType);
 
+  if (type === "PURCHASE") {
+    const savedMovement = await createPurchaseMovementFromApi(movement, items);
+
+    if (savedMovement) {
+      addMovementToLocalStore(savedMovement);
+      resetMovementStateAfterRegister(type, sourceType, movement);
+      refreshMovimentacoesPage();
+      return;
+    }
+
+    if (savedMovement === false) return;
+  }
+
+  addLocalMovement(type, movement, items);
+  resetMovementStateAfterRegister(type, sourceType, movement);
+
+  refreshMovimentacoesPage();
+}
+
+function addLocalMovement(type, movement, items) {
   lineStore.stockMovements.unshift(movement);
 
   items.forEach((item) => {
-  lineStore.stockMovementItems.unshift({
-    id: crypto.randomUUID(),
-    movementId: movement.id,
-    materialName: item.materialName,
-    materialCode: item.materialCode,
-    quantity: Number(item.quantity || 0),
-    unit: item.unit,
-    secondaryUnit: item.secondaryUnit || "",
-    secondaryUnitMode: item.secondaryUnitMode || "manual",
-    fixedPrimaryQuantity: item.fixedPrimaryQuantity || "",
-    fixedSecondaryQuantity: item.fixedSecondaryQuantity || "",
-    lots: (item.lots || []).map((lot) => {
-  const movementQuantity =
-    (type === "SALE" || type === "RETURN" || type === "TRANSFER")
-      ? Number(lot.exitQuantity || 0)
-      : type === "ADJUSTMENT"
-        ? Number(lot.adjustmentQuantity || 0)
-        : type === "INVENTORY"
-          ? Number(lot.countedQuantity || 0)
-          : Number(lot.quantity || 0);
-
-  const lotPayload = {
-    ...lot,
-
-    movementQuantity,
-
-    quantity: movementQuantity,
-    secondaryUnit: item.secondaryUnit || lot.secondaryUnit || "",
-
-    movementType: type,
-
-    locationName:
-      type === "TRANSFER"
-        ? transferFormState.originLocation
-        : type === "SALE"
-          ? saleFormState.locationName
-          : type === "RETURN"
-            ? returnFormState.locationName
+    lineStore.stockMovementItems.unshift({
+      id: crypto.randomUUID(),
+      movementId: movement.id,
+      materialName: item.materialName,
+      materialCode: item.materialCode,
+      quantity: Number(item.quantity || 0),
+      unit: item.unit,
+      secondaryUnit: item.secondaryUnit || "",
+      secondaryUnitMode: item.secondaryUnitMode || "manual",
+      fixedPrimaryQuantity: item.fixedPrimaryQuantity || "",
+      fixedSecondaryQuantity: item.fixedSecondaryQuantity || "",
+      lots: (item.lots || []).map((lot) => {
+        const movementQuantity =
+          (type === "SALE" || type === "RETURN" || type === "TRANSFER")
+            ? Number(lot.exitQuantity || 0)
             : type === "ADJUSTMENT"
-              ? adjustmentFormState.locationName
+              ? Number(lot.adjustmentQuantity || 0)
               : type === "INVENTORY"
-                ? inventoryFormState.locationName
-                : movementFormState.locationName
-  };
+                ? Number(lot.countedQuantity || 0)
+                : Number(lot.quantity || 0);
 
-  applyLotSecondaryQuantity(item, lotPayload, movementQuantity);
+        const lotPayload = {
+          ...lot,
+          movementQuantity,
+          quantity: movementQuantity,
+          secondaryUnit: item.secondaryUnit || lot.secondaryUnit || "",
+          movementType: type,
+          locationName:
+            type === "TRANSFER"
+              ? transferFormState.originLocation
+              : type === "SALE"
+                ? saleFormState.locationName
+                : type === "RETURN"
+                  ? returnFormState.locationName
+                  : type === "ADJUSTMENT"
+                    ? adjustmentFormState.locationName
+                    : type === "INVENTORY"
+                      ? inventoryFormState.locationName
+                      : movementFormState.locationName
+        };
 
-  return lotPayload;
-})
+        applyLotSecondaryQuantity(item, lotPayload, movementQuantity);
+
+        return lotPayload;
+      })
+    });
   });
-});
+}
 
+function resetMovementStateAfterRegister(type, sourceType, movement) {
   if (sourceType === "IMPORT") {
     registerImportControl(type, movement);
   }
 
   movementSystemNotice = null;
-
   movementDraftItems = [];
   importPreviewItems = [];
-
   movementFormState = createPurchaseFormState(getToday);
   saleFormState = createSaleFormState(getToday);
-
   returnFormState = createReturnFormState(getToday);
   transferFormState = createTransferFormState(getToday);
+  purchaseAttachmentFile = null;
+  purchaseAttachmentUrl = "";
+}
 
-purchaseAttachmentFile = null;
-purchaseAttachmentUrl = "";
+async function createPurchaseMovementFromApi(movement, items) {
+  try {
+    const payload = {
+      type: "PURCHASE",
+      movementDate: movement.movementDate,
+      supplierName: movement.supplierName,
+      locationName: movement.locationName,
+      fiscalNumber: movement.fiscalNumber,
+      observation: movement.observation,
+      items: items.map((item) => ({
+        materialId: item.materialId || null,
+        materialCode: item.materialCode,
+        materialName: item.materialName,
+        quantity: Number(item.quantity || 0),
+        unit: item.unit,
+        secondaryQuantity: getItemSecondaryQuantity(item),
+        secondaryUnit: item.secondaryUnit || "",
+        lots: (item.lots || []).map((lot) => ({
+          lotCode: lot.lotCode,
+          quantity: Number(lot.quantity || 0),
+          secondaryQuantity: lot.secondaryQuantity === "" || lot.secondaryQuantity === undefined || lot.secondaryQuantity === null
+            ? null
+            : Number(lot.secondaryQuantity || 0),
+          notes: lot.notes || ""
+        }))
+      }))
+    };
 
-  refreshMovimentacoesPage();
+    const savedMovement = await apiPost("/api/stock-movements", payload);
+    return normalizeApiMovement(savedMovement);
+  } catch (error) {
+    if (!shouldUseLocalFallback(error)) {
+      movementSystemNotice = {
+        type: "danger",
+        title: "Compra nao registrada",
+        message: error.message
+      };
+      refreshMovimentacoesPage();
+      return false;
+    }
+
+    console.log("API indisponivel, registrando compra localmente");
+    return null;
+  }
+}
+
+function getItemSecondaryQuantity(item) {
+  if (!item.secondaryUnit) return null;
+
+  const total = (item.lots || []).reduce((sum, lot) => {
+    return sum + Number(lot.secondaryQuantity || 0);
+  }, 0);
+
+  return total || null;
 }
 
 function buildMovementHeader(type, sourceType) {
@@ -3352,12 +3427,18 @@ document.querySelectorAll(".edit-lot-secondary-quantity").forEach((input) => {
   refreshMovimentacoesPage();
 }
 
-function deleteMovement() {
+async function deleteMovement() {
   if (!movementDeleteTargetId) return;
 
   const movement = lineStore.stockMovements.find((item) => {
     return item.id === movementDeleteTargetId;
   });
+
+  if (movement?.type === "PURCHASE") {
+    const changed = await changePurchaseMovementStatusFromApi(movement.id, "cancel");
+
+    if (changed !== null) return;
+  }
 
   if (movement) {
     movement.status = "Cancelado";
@@ -3370,12 +3451,18 @@ function deleteMovement() {
   refreshMovimentacoesPage();
 }
 
-function reprocessMovement() {
+async function reprocessMovement() {
   if (!movementReprocessTargetId) return;
 
   const movement = lineStore.stockMovements.find((item) => {
     return item.id === movementReprocessTargetId;
   });
+
+  if (movement?.type === "PURCHASE") {
+    const changed = await changePurchaseMovementStatusFromApi(movement.id, "reprocess");
+
+    if (changed !== null) return;
+  }
 
   if (movement) {
     movement.status = "Reprocessado";
@@ -3386,6 +3473,36 @@ function reprocessMovement() {
   isEditingMovement = false;
 
   refreshMovimentacoesPage();
+}
+
+async function changePurchaseMovementStatusFromApi(movementId, action) {
+  try {
+    const updatedMovement = await apiPost(`/api/stock-movements/${movementId}/${action}`, {});
+    addMovementToLocalStore(normalizeApiMovement(updatedMovement));
+
+    movementDeleteTargetId = null;
+    movementReprocessTargetId = null;
+    isEditingMovement = false;
+
+    await reloadPurchaseMovementsAndStockFromApi();
+    return true;
+  } catch (error) {
+    if (shouldUseLocalFallback(error)) {
+      console.log("API indisponivel, alterando status da compra localmente");
+      return null;
+    }
+
+    movementSystemNotice = {
+      type: "danger",
+      title: action === "cancel" ? "Compra nao cancelada" : "Compra nao reprocessada",
+      message: error.message
+    };
+    movementDeleteTargetId = null;
+    movementReprocessTargetId = null;
+    isEditingMovement = false;
+    refreshMovimentacoesPage();
+    return false;
+  }
 }
 
 function getMovementStatusClass(status) {
@@ -3435,6 +3552,192 @@ function formatMovementHistoryDate(movement) {
   }
 
   return formatDateTime(movement.dateTime);
+}
+
+async function loadPurchaseReferencesFromApi() {
+  if (hasTriedReferenceApiLoad) return;
+
+  hasTriedReferenceApiLoad = true;
+
+  try {
+    const [apiMaterials, apiLocations, apiSuppliers] = await Promise.all([
+      apiGet("/api/materials"),
+      apiGet("/api/locations"),
+      apiGet("/api/suppliers")
+    ]);
+
+    lineStore.materials.splice(0, lineStore.materials.length, ...apiMaterials.map(normalizeApiMaterial).filter(isActiveItem));
+    lineStore.locations.splice(0, lineStore.locations.length, ...apiLocations.map(normalizeApiLocation).filter(isActiveItem));
+    lineStore.suppliers.splice(0, lineStore.suppliers.length, ...apiSuppliers.map(normalizeApiSupplier).filter(isActiveItem));
+    refreshMovimentacoesPage();
+  } catch (error) {
+    console.log("API indisponivel, usando referencias locais de movimentacoes");
+  }
+}
+
+async function loadPurchaseMovementsFromApi(force = false) {
+  if (hasTriedPurchaseApiLoad && !force) return;
+
+  hasTriedPurchaseApiLoad = true;
+
+  try {
+    const apiMovements = await apiGet("/api/stock-movements");
+    const purchases = apiMovements.map(normalizeApiMovement);
+
+    lineStore.stockMovements.splice(
+      0,
+      lineStore.stockMovements.length,
+      ...lineStore.stockMovements.filter((movement) => movement.type !== "PURCHASE"),
+      ...purchases
+    );
+
+    lineStore.stockMovementItems.splice(
+      0,
+      lineStore.stockMovementItems.length,
+      ...lineStore.stockMovementItems.filter((item) => {
+        return !purchases.some((movement) => movement.id === item.movementId);
+      })
+    );
+
+    purchases.forEach((movement) => addMovementItemsToLocalStore(movement));
+    refreshMovimentacoesPage();
+  } catch (error) {
+    if (!shouldUseLocalFallback(error)) {
+      movementSystemNotice = {
+        type: "danger",
+        title: "Historico nao recarregado",
+        message: error.message
+      };
+      refreshMovimentacoesPage();
+      return;
+    }
+
+    console.log("API indisponivel, usando historico local de compras");
+  }
+}
+
+async function reloadPurchaseMovementsAndStockFromApi() {
+  await loadPurchaseMovementsFromApi(true);
+
+  try {
+    await apiGet("/api/stock");
+  } catch (error) {
+    console.log(
+      shouldUseLocalFallback(error)
+        ? "API indisponivel ao recarregar estoque apos movimentacao"
+        : `Estoque nao recarregado: ${error.message}`
+    );
+  }
+}
+
+function addMovementToLocalStore(movement) {
+  lineStore.stockMovements = lineStore.stockMovements.filter((item) => item.id !== movement.id);
+  lineStore.stockMovementItems = lineStore.stockMovementItems.filter((item) => item.movementId !== movement.id);
+  lineStore.stockMovements.unshift(movement);
+  addMovementItemsToLocalStore(movement);
+}
+
+function addMovementItemsToLocalStore(movement) {
+  (movement.items || []).forEach((item) => {
+    lineStore.stockMovementItems.unshift({
+      ...item,
+      movementId: movement.id
+    });
+  });
+}
+
+function normalizeApiMovement(movement) {
+  return {
+    id: movement.id,
+    type: movement.type || movement.movementType || "PURCHASE",
+    typeLabel: movement.typeLabel || "Compra",
+    sourceType: movement.sourceType || "API",
+    sourceLabel: movement.sourceLabel || "Neon",
+    dateTime: movement.dateTime || movement.movementDate || movement.createdAt,
+    movementDate: getDateOnly(movement.movementDate || movement.dateTime || movement.createdAt),
+    locationId: movement.locationId || "",
+    locationName: movement.locationName || "",
+    supplierId: movement.supplierId || "",
+    supplierName: movement.supplierName || "",
+    fiscalNumber: movement.fiscalNumber || movement.documentNumber || "",
+    observation: movement.observation || movement.notes || "",
+    status: movement.status || "Processado",
+    responsibleName: movement.responsibleName || "API",
+    createdAt: movement.createdAt,
+    updatedAt: movement.updatedAt,
+    items: Array.isArray(movement.items) ? movement.items.map(normalizeApiMovementItem) : []
+  };
+}
+
+function normalizeApiMovementItem(item) {
+  return {
+    id: item.id,
+    movementId: item.movementId,
+    materialId: item.materialId || "",
+    materialName: item.materialName || "",
+    materialCode: item.materialCode || "",
+    quantity: Number(item.quantity || 0),
+    unit: item.unit || "un",
+    secondaryQuantity: Number(item.secondaryQuantity || 0),
+    secondaryUnit: item.secondaryUnit || "",
+    lots: Array.isArray(item.lots) ? item.lots.map((lot) => ({
+      id: lot.id,
+      sourceLotId: lot.sourceLotId || lot.lotId,
+      lotId: lot.lotId || lot.sourceLotId,
+      lotCode: lot.lotCode || "",
+      quantity: Number(lot.quantity || 0),
+      movementQuantity: Number(lot.movementQuantity ?? lot.quantity ?? 0),
+      secondaryQuantity: Number(lot.secondaryQuantity || 0),
+      secondaryUnit: lot.secondaryUnit || item.secondaryUnit || "",
+      locationName: lot.locationName || "",
+      productionDate: lot.productionDate || ""
+    })) : []
+  };
+}
+
+function normalizeApiMaterial(material) {
+  return {
+    id: material.id,
+    code: material.code || "",
+    name: material.name || "",
+    type: material.type || "",
+    unit: material.unit || material.primaryUnit || "un",
+    secondaryUnit: material.secondaryUnit || "",
+    secondaryUnitMode: material.secondaryUnitMode || "manual",
+    fixedPrimaryQuantity: material.fixedPrimaryQuantity || "",
+    fixedSecondaryQuantity: material.fixedSecondaryQuantity || "",
+    status: material.status || "Ativo"
+  };
+}
+
+function normalizeApiLocation(location) {
+  return {
+    id: location.id,
+    name: location.name || "",
+    code: location.code || "",
+    type: location.type || "",
+    isStockLocation: Boolean(location.storage),
+    isSaleLocation: Boolean(location.sale),
+    status: location.status || "Ativo"
+  };
+}
+
+function normalizeApiSupplier(supplier) {
+  return {
+    id: supplier.id,
+    name: supplier.name || "",
+    document: supplier.document || "",
+    contact: supplier.contact || "",
+    status: supplier.status || "Ativo"
+  };
+}
+
+function shouldUseLocalFallback(error) {
+  return !error.status;
+}
+
+function isActiveItem(item) {
+  return item.status !== "Inativo";
 }
 
 

@@ -1,4 +1,4 @@
-import { pages } from "../../pages/index.js";
+import { pages } from "../../pages/index.js?v=purchase-neon";
 
 export function setupNavigation() {
   document.querySelectorAll(".nav-item").forEach((button) => {
@@ -19,7 +19,7 @@ export function setupNavigation() {
   
 }
 
-export function navigateTo(pageKey) {
+export async function navigateTo(pageKey) {
   const page = pages[pageKey] || pages.dashboard;
 
   document.querySelectorAll(".nav-item").forEach((item) => {
@@ -27,6 +27,10 @@ export function navigateTo(pageKey) {
   });
 
   const content = document.getElementById("appContent");
+
+  content.innerHTML = renderLinePageLoader(page);
+
+  await new Promise((resolve) => setTimeout(resolve, 120));
 
   content.innerHTML = `
     <div class="page-header">
@@ -38,7 +42,21 @@ export function navigateTo(pageKey) {
   `;
 
   if (typeof page.afterRender === "function") {
-  page.afterRender();
+    await page.afterRender({ navigation: true });
+  }
+
 }
 
+function renderLinePageLoader(page) {
+  return `
+    <div class="line-page-loader">
+      <div class="line-loader-mark">
+        <span></span>
+        <span></span>
+        <span></span>
+      </div>
+      <strong>Line</strong>
+      <small>${page.title || "Carregando"}</small>
+    </div>
+  `;
 }

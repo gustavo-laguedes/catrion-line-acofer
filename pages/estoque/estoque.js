@@ -1,5 +1,9 @@
 import { lineStore } from "../../shared/data-store.js";
 import { buildStockSnapshot } from "../../shared/stock-engine.js";
+import { apiGet } from "../../shared/api-client.js";
+
+let apiStockSnapshot = null;
+let hasTriedApiLoad = false;
 
 let stockFilters = {
   search: "",
@@ -47,6 +51,8 @@ function renderEstoque() {
 }
 
 function getMaterialStockGroups() {
+  if (apiStockSnapshot) return apiStockSnapshot.groups;
+
   return buildStockSnapshot(lineStore).groups;
 }
 
@@ -375,7 +381,7 @@ function renderLotCard(lot, unit, balance = null) {
 
         <div>
           <small>Produção</small>
-          <strong>${formatDateTime(lot.productionDate)}</strong>
+          <strong>${formatDateTime(lot.createdAt || lot.productionDate)}</strong>
         </div>
       </div>
     </div>
@@ -383,6 +389,12 @@ function renderLotCard(lot, unit, balance = null) {
 }
 
 function getLotsByMaterialAndLocation(materialCode, locationName) {
+  if (apiStockSnapshot) {
+    return apiStockSnapshot.lots.filter((lot) => {
+      return lot.balanceMaterialCode === materialCode && lot.locationName === locationName;
+    });
+  }
+
   return buildStockSnapshot(lineStore).lots.filter((lot) => {
     return lot.balanceMaterialCode === materialCode && lot.locationName === locationName;
   });
@@ -425,7 +437,9 @@ function renderEmptyStock() {
   `;
 }
 
-function setupEstoqueEvents() {
+function setupEstoqueEvents(options = {}) {
+  const loadPromise = loadStockFromApi(Boolean(options.navigation));
+
   const searchInput = document.getElementById("stockSearchInput");
   const typeFilter = document.getElementById("stockTypeFilter");
   const locationFilter = document.getElementById("stockLocationFilter");
@@ -481,6 +495,97 @@ function setupEstoqueEvents() {
       refreshStockPage();
     });
   });
+
+  return loadPromise;
+}
+
+async function loadStockFromApi(force = false) {
+  if (hasTriedApiLoad && !force) return;
+
+  hasTriedApiLoad = true;
+
+  try {
+    const snapshot = await apiGet("/api/stock");
+    apiStockSnapshot = normalizeStockSnapshot(snapshot);
+    refreshStockPage();
+  } catch (error) {
+    apiStockSnapshot = null;
+    console.log("API indisponivel, usando estoque local");
+  }
+}
+
+function normalizeStockSnapshot(snapshot) {
+  return {
+    groups: Array.isArray(snapshot?.groups) ? snapshot.groups.map(normalizeStockGroup) : [],
+    lots: Array.isArray(snapshot?.lots) ? snapshot.lots.map(normalizeStockLot) : []
+  };
+}
+
+function normalizeStockGroup(group) {
+  const quantity = parseStockNumber(group.quantity);
+  const reservedQuantity = parseStockNumber(group.reservedQuantity);
+
+  return {
+    materialId: group.materialId || "",
+    materialCode: group.materialCode || "",
+    materialName: group.materialName || "Material nao informado",
+    materialType: group.materialType || "Sem tipo",
+    unit: group.unit || "-",
+    secondaryUnit: group.secondaryUnit || "",
+    minStock: parseStockNumber(group.minStock),
+    quantity,
+    secondaryQuantity: parseStockNumber(group.secondaryQuantity),
+    reservedQuantity,
+    availableQuantity: parseStockNumber(group.availableQuantity ?? quantity - reservedQuantity),
+    locations: Array.isArray(group.locations) ? group.locations : [],
+    locationNames: group.locationNames || "-",
+    locationBalances: Array.isArray(group.locationBalances)
+      ? group.locationBalances.map(normalizeLocationBalance)
+      : [],
+    status: group.status || group.statusLabel || "",
+    statusLabel: group.statusLabel || group.status || ""
+  };
+}
+
+function normalizeLocationBalance(locationBalance) {
+  const quantity = parseStockNumber(locationBalance.quantity);
+  const reservedQuantity = parseStockNumber(locationBalance.reservedQuantity);
+
+  return {
+    locationName: locationBalance.locationName || "Local nao informado",
+    quantity,
+    secondaryQuantity: parseStockNumber(locationBalance.secondaryQuantity),
+    reservedQuantity,
+    availableQuantity: parseStockNumber(locationBalance.availableQuantity ?? quantity - reservedQuantity),
+    status: locationBalance.status || ""
+  };
+}
+
+function normalizeStockLot(lot) {
+  const quantity = parseStockNumber(lot.quantity);
+  const reservedQuantity = parseStockNumber(lot.reservedQuantity);
+
+  return {
+    id: lot.id,
+    balanceId: lot.balanceId,
+    balanceMaterialCode: lot.balanceMaterialCode || lot.materialCode || "",
+    materialId: lot.materialId || "",
+    materialName: lot.materialName || "",
+    locationId: lot.locationId || "",
+    locationName: lot.locationName || "Local nao informado",
+    lotCode: lot.lotCode || "",
+    origin: lot.origin || "Origem nao informada",
+    productionDate: lot.productionDate || "",
+    createdAt: lot.createdAt || "",
+    quantity,
+    secondaryQuantity: parseStockNumber(lot.secondaryQuantity),
+    reservedQuantity,
+    availableQuantity: parseStockNumber(lot.availableQuantity ?? quantity - reservedQuantity),
+    unit: lot.unit || "-",
+    secondaryUnit: lot.secondaryUnit || "",
+    status: lot.status || "",
+    updatedAt: lot.updatedAt
+  };
 }
 
 function refreshStockPage() {
@@ -520,7 +625,8 @@ function formatDateTime(value) {
   const formattedDate = date.toLocaleDateString("pt-BR");
   const formattedTime = date.toLocaleTimeString("pt-BR", {
     hour: "2-digit",
-    minute: "2-digit"
+    minute: "2-digit",
+    second: "2-digit"
   });
 
   return `${formattedDate} ${formattedTime}`;

@@ -1,14 +1,20 @@
 import { lineStore, getActiveItems } from "../../shared/data-store.js";
 import { buildStockSnapshot } from "../../shared/stock-engine.js";
+import { apiGet, apiPost, apiPut } from "../../shared/api-client.js";
 
 let activeProductionTab = "NEW";
 let productionDraft = createProductionDraft();
 let producedLots = [createProducedLotDraft(1)];
 let productionNotice = null;
+let apiStockSnapshot = null;
+let hasLoadedProductionApi = false;
 let selectedProductionRecordId = null;
 let pendingProductionPayload = null;
-let isProductionActionMode = false;
+let isProductionEditMode = false;
+let productionEditDraft = null;
+let productionEditRecordId = null;
 let productionStatusAction = null;
+let productionOutputLotAction = null;
 let productionHistoryFilters = {
   search: "",
   date: "",
@@ -19,12 +25,14 @@ let productionHistorySort = {
   direction: "desc"
 };
 
-export const producaoPage = {
+export const produçãoPage = {
   title: "⚙️ Produção",
   subtitle: "Apontamentos, transformação de lotes e geração de novos lotes",
-  render: renderProducao,
-  afterRender: setupProducaoEvents
+  render: renderProdução,
+  afterRender: setupProduçãoEvents
 };
+
+export const producaoPage = produçãoPage;
 
 function createProductionDraft() {
   return {
@@ -59,7 +67,60 @@ function showProductionError(message) {
   showProductionNotice();
 }
 
-function renderProducao() {
+function showProductionBlockingAlert(title, message) {
+  document.querySelector(".production-alert-backdrop")?.remove();
+
+  const alert = document.createElement("div");
+  alert.className = "modal-backdrop open danger-backdrop production-alert-backdrop";
+  alert.innerHTML = `
+    <div class="modal danger-modal production-alert-modal">
+      <div class="delete-alert-icon">⚠️</div>
+
+      <div class="modal-header vertical">
+        <div>
+          <h2>${title}</h2>
+          <p>${message}</p>
+        </div>
+      </div>
+
+      <div class="danger-warning-box">
+        <strong>Atenção:</strong>
+        <span>Revise o saldo disponível antes de tentar reprocessar novamente.</span>
+      </div>
+
+      <div class="modal-footer">
+        <button class="primary-btn" id="closeProductionAlertBtn" type="button">Entendi</button>
+      </div>
+    </div>
+  `;
+  document.getElementById("appContent")?.appendChild(alert);
+
+  alert.querySelector("#closeProductionAlertBtn")?.addEventListener("click", closeProductionBlockingAlert);
+}
+
+function getOutputLotStatusErrorMessage(error, action) {
+  const message = error?.data?.error || error?.message || "";
+  const fallback = action === "reprocess"
+    ? "Não há estoque disponível suficiente para reprocessar este lote."
+    : "Não foi possível alterar este lote produzido.";
+
+  return message && !/^Erro HTTP/i.test(message) ? message : fallback;
+}
+
+function getProductionStatusErrorMessage(error, status) {
+  const message = error?.data?.error || error?.message || "";
+  const fallback = status === "Reprocessado"
+    ? "Não há estoque disponível suficiente para reprocessar esta produção."
+    : "Não foi possível alterar o status desta produção.";
+
+  return message && !/^Erro HTTP/i.test(message) ? message : fallback;
+}
+
+function closeProductionBlockingAlert() {
+  document.querySelector(".production-alert-backdrop")?.remove();
+}
+
+function renderProdução() {
   applyProductionDefaults();
 
   return `
@@ -325,6 +386,12 @@ function renderProducedLotCard(lot, index, material) {
           <h4>${material.name}</h4>
           <p>Lote produzido ${index + 1}</p>
         </div>
+
+        ${
+          producedLots.length > 1
+            ? `<button class="secondary-btn remove-produced-lot-btn" data-produced-lot-index="${index}" type="button">Remover</button>`
+            : ""
+        }
       </div>
 
       <div class="form-grid">
@@ -473,19 +540,46 @@ function renderProductionHistoryTable(records) {
 
             return `
               <tr class="production-history-row ${record.status === "Cancelado" ? "production-history-row-canceled" : ""}" data-production-record-id="${record.id}">
-                <td>${formatDateOnly(record.productionDate)}</td>
+                <td>${formatDateTime(record.createdAt || record.productionDate)}</td>
                 <td><strong>${record.outputMaterialName}</strong></td>
                 <td>${formatNumber(record.outputQuantity)} ${record.outputUnit}</td>
-                <td>${lots.length ? lots.map((lot) => lot.lotCode).join(" / ") : record.generatedLotCode || "-"}</td>
+                <td>${renderProductionHistoryLots(lots, record)}</td>
                 <td>${record.locationName || "-"}</td>
                 <td>${record.machineName || "-"}</td>
-                <td><span class="badge ${getProductionStatusBadgeClass(record.status)}">${record.status}</span></td>
+                <td>${renderProductionHistoryStatus(record, lots)}</td>
               </tr>
             `;
           }).join("")}
         </tbody>
       </table>
     </div>
+  `;
+}
+
+function isProductionLotCanceled(lot) {
+  return lot?.status === "Cancelado" || lot?.lotStatus === "Cancelado";
+}
+
+function hasPartiallyCanceledOutput(record, lots = getGeneratedLotsByRecord(record.id)) {
+  return (record.status === "Processado" || record.status === "Reprocessado") && lots.some(isProductionLotCanceled);
+}
+
+function renderProductionHistoryLots(lots, record) {
+  if (!lots.length) return record.generatedLotCode || "-";
+
+  return lots.map((lot) => `
+    <span class="production-history-lot ${isProductionLotCanceled(lot) ? "is-canceled" : ""}">
+      ${lot.lotCode || "-"}
+    </span>
+  `).join(" / ");
+}
+
+function renderProductionHistoryStatus(record, lots) {
+  return `
+    <span class="production-history-status">
+      <span class="badge ${getProductionStatusBadgeClass(record.status)}">${record.status}</span>
+    ${hasPartiallyCanceledOutput(record, lots) ? `<span class="badge badge-danger production-partial-cancel-badge">Cancelado parcialmente</span>` : ""}
+    </span>
   `;
 }
 
@@ -540,27 +634,31 @@ function getProductionStatusBadgeClass(status) {
   return "badge-success";
 }
 
-function setupProducaoEvents() {
+function setupProduçãoEvents(options = {}) {
   compactProductionLayout();
   setupProductionHistoryEvents();
+  const shouldRefreshAfterLoad = options.navigation || !hasLoadedProductionApi;
+  const loadPromise = loadProductionPageFromApi(Boolean(options.navigation)).then(() => {
+    if (shouldRefreshAfterLoad) rerenderProdução();
+  });
 
   document.querySelectorAll("[data-production-tab]").forEach((button) => {
     button.addEventListener("click", () => {
       activeProductionTab = button.dataset.productionTab;
-      rerenderProducao();
+      rerenderProdução();
     });
   });
 
   document.getElementById("productionDate")?.addEventListener("change", () => {
     captureProductionDraft();
     syncProducedLotCodes(true);
-    rerenderProducao();
+    rerenderProdução();
   });
 
   document.getElementById("productionLocation")?.addEventListener("change", () => {
     captureProductionDraft();
     productionDraft.consumedLotCode = "";
-    rerenderProducao();
+    rerenderProdução();
   });
 
   document.getElementById("productionOutputMaterial")?.addEventListener("change", () => {
@@ -571,7 +669,7 @@ function setupProducaoEvents() {
     producedLots = [createProducedLotDraft(1)];
     applyProductionDefaults();
     syncProducedLotCodes(true);
-    rerenderProducao();
+    rerenderProdução();
   });
 
   document.getElementById("productionModel")?.addEventListener("change", () => {
@@ -580,13 +678,13 @@ function setupProducaoEvents() {
     productionDraft.consumedLotCode = "";
     applyProductionDefaults();
     syncProducedLotCodes(true);
-    rerenderProducao();
+    rerenderProdução();
   });
 
   document.getElementById("productionMachine")?.addEventListener("change", () => {
     captureProductionDraft();
     syncProducedLotCodes(true);
-    rerenderProducao();
+    rerenderProdução();
   });
 
   document.getElementById("productionObservation")?.addEventListener("input", () => {
@@ -602,7 +700,7 @@ function setupProducaoEvents() {
   document.querySelectorAll(".production-consumed-lot-radio").forEach((input) => {
     input.addEventListener("change", () => {
       productionDraft.consumedLotCode = input.value;
-      rerenderProducao();
+      rerenderProdução();
     });
   });
 
@@ -622,10 +720,31 @@ function setupProducaoEvents() {
     captureProducedLots();
     producedLots.push(createProducedLotDraft(producedLots.length + 1));
     syncProducedLotCodes();
-    rerenderProducao();
+    rerenderProdução();
+  });
+
+  document.querySelectorAll(".remove-produced-lot-btn").forEach((button) => {
+    button.addEventListener("click", () => {
+      removeProducedLot(button.dataset.producedLotIndex);
+    });
   });
 
   document.getElementById("registerProductionBtn")?.addEventListener("click", registerProduction);
+
+  return loadPromise;
+}
+
+function removeProducedLot(index) {
+  if (producedLots.length <= 1) return;
+
+  captureProducedLots();
+  producedLots.splice(Number(index), 1);
+  producedLots = producedLots.map((lot, lotIndex) => ({
+    ...lot,
+    sequence: lotIndex + 1
+  }));
+  syncProducedLotCodes(true);
+  rerenderProdução();
 }
 
 function registerProduction() {
@@ -802,7 +921,7 @@ function registerProduction() {
   productionNotice = null;
   activeProductionTab = "HISTORY";
 
-  rerenderProducao();
+  rerenderProdução();
 }
 
 function captureProductionDraft() {
@@ -841,7 +960,7 @@ function updateProducedLot(index, patch, shouldRerender = false) {
   updateProductionLimitSummary();
 
   if (shouldRerender) {
-    rerenderProducao();
+    rerenderProdução();
   }
 }
 
@@ -1017,7 +1136,7 @@ function getModelConsumedInput(model) {
 function getAvailableConsumedLots(consumedInput) {
   if (!consumedInput || !productionDraft.locationName) return [];
 
-  const snapshot = buildStockSnapshot(lineStore);
+  const snapshot = apiStockSnapshot || buildStockSnapshot(lineStore);
 
   return snapshot.lots
     .filter((lot) => {
@@ -1029,9 +1148,11 @@ function getAvailableConsumedLots(consumedInput) {
     })
     .map((lot) => ({
       id: lot.id,
+      lotId: lot.lotId || lot.id,
       lotCode: lot.lotCode,
       locationName: lot.locationName,
-      quantity: Number(lot.quantity || 0)
+      quantity: Number(lot.availableQuantity ?? lot.quantity ?? 0),
+      secondaryQuantity: Number(lot.secondaryQuantity || 0)
     }));
 }
 
@@ -1284,7 +1405,7 @@ function deletePendingProductionDraft() {
   producedLots = [createProducedLotDraft(1)];
   productionNotice = null;
   activeProductionTab = "NEW";
-  rerenderProducao();
+  rerenderProdução();
 }
 
 function renderProductionConfirmModal(payload) {
@@ -1300,7 +1421,7 @@ function renderProductionConfirmModal(payload) {
       </div>
 
       <div class="movement-detail-grid">
-        <div><small>Data</small><strong>${formatDateOnly(record.productionDate)}</strong></div>
+        <div><small>Data</small><strong>${formatDateTime(record.createdAt || record.productionDate)}</strong></div>
         <div><small>Local</small><strong>${record.locationName || "-"}</strong></div>
         <div><small>Material produzido</small><strong>${record.outputMaterialName || "-"}</strong></div>
         <div><small>Modelo</small><strong>${record.productionModelName || "-"}</strong></div>
@@ -1316,10 +1437,10 @@ function renderProductionConfirmModal(payload) {
         secondaryQuantity: lot.outputSecondaryQuantity,
         unit: record.outputUnit,
         secondaryUnit: record.outputSecondaryUnit
-      })), record)}
+      })), record, "production-confirm-output-lots")}
 
       ${
-        record.observation
+        !isProductionEditMode && record.observation
           ? `<div class="movement-detail-note"><strong>Observação:</strong> ${record.observation}</div>`
           : ""
       }
@@ -1335,10 +1456,27 @@ function renderProductionConfirmModal(payload) {
   `;
 }
 
-function confirmProductionRegistration() {
+async function confirmProductionRegistration() {
   if (!pendingProductionPayload) return;
 
   const { record, producedLots: lots, consumedInput, consumedLot, consumedQuantity } = pendingProductionPayload;
+
+  const savedProduction = await createProductionFromApi(pendingProductionPayload);
+
+  if (savedProduction !== null) {
+    if (savedProduction) {
+      pendingProductionPayload = null;
+      closeProductionConfirmModal();
+      productionDraft = createProductionDraft();
+      producedLots = [createProducedLotDraft(1)];
+      productionNotice = null;
+      activeProductionTab = "HISTORY";
+      await reloadProductionFromApi();
+      rerenderProdução();
+    }
+
+    return;
+  }
 
   lineStore.productionRecords.unshift(record);
 
@@ -1389,7 +1527,7 @@ function confirmProductionRegistration() {
   productionNotice = null;
   activeProductionTab = "HISTORY";
 
-  rerenderProducao();
+  rerenderProdução();
 }
 
 function compactProductionLayout() {
@@ -1469,12 +1607,12 @@ function setupProductionHistoryEvents() {
 
   document.getElementById("productionHistoryDate")?.addEventListener("change", (event) => {
     productionHistoryFilters.date = event.target.value;
-    rerenderProducao();
+    rerenderProdução();
   });
 
   document.getElementById("productionHistoryStatus")?.addEventListener("change", (event) => {
     productionHistoryFilters.status = event.target.value;
-    rerenderProducao();
+    rerenderProdução();
   });
 
   setupProductionHistoryTableEvents();
@@ -1513,13 +1651,23 @@ function setupProductionHistoryTableEvents() {
   });
 }
 
-function openProductionRecordModal(recordId, actionMode = false) {
+function openProductionRecordModal(recordId, editMode = false) {
   selectedProductionRecordId = recordId;
-  isProductionActionMode = actionMode;
+  isProductionEditMode = editMode;
   document.querySelector(".production-detail-backdrop")?.remove();
 
   const record = (lineStore.productionRecords || []).find((item) => item.id === recordId);
   if (!record) return;
+
+  if (editMode && productionEditRecordId !== recordId) {
+    productionEditRecordId = recordId;
+    productionEditDraft = createProductionEditDraft(record);
+  }
+
+  if (!editMode) {
+    productionEditRecordId = null;
+    productionEditDraft = null;
+  }
 
   const modal = document.createElement("div");
   modal.className = "modal-backdrop open movement-detail-backdrop production-detail-backdrop";
@@ -1527,23 +1675,50 @@ function openProductionRecordModal(recordId, actionMode = false) {
   document.getElementById("appContent").appendChild(modal);
 
   modal.querySelector("#closeProductionDetailBtn")?.addEventListener("click", closeProductionRecordModal);
-  modal.querySelector("#closeProductionDetailFooterBtn")?.addEventListener("click", closeProductionRecordModal);
+  modal.querySelector("#closeProductionDetailFooterBtn")?.addEventListener("click", () => {
+    if (isProductionEditMode) {
+      openProductionRecordModal(record.id, false);
+      return;
+    }
+
+    closeProductionRecordModal();
+  });
   modal.querySelector("#editProductionBtn")?.addEventListener("click", () => {
     openProductionRecordModal(record.id, true);
   });
+  modal.querySelector("#cancelProductionEditBtn")?.addEventListener("click", () => {
+    openProductionRecordModal(record.id, false);
+  });
+  modal.querySelector("#saveProductionEditBtn")?.addEventListener("click", () => {
+    saveProductionEdit(record.id);
+  });
+  setupProductionEditModalEvents(record);
   modal.querySelector("#cancelProductionBtn")?.addEventListener("click", () => openProductionStatusWarning(record.id, "Cancelado"));
   modal.querySelector("#reprocessProductionBtn")?.addEventListener("click", () => openProductionStatusWarning(record.id, "Reprocessado"));
+  modal.querySelectorAll(".production-output-lot-status-btn").forEach((button) => {
+    button.addEventListener("click", () => {
+      const outputLot = (productionEditDraft?.outputLots || []).find((lot) => lot.lotId === button.dataset.outputLotId || lot.id === button.dataset.outputLotId);
+      if (!outputLot) return;
+      openProductionOutputLotWarning(record.id, outputLot, button.dataset.outputLotAction);
+    });
+  });
 }
 
 function closeProductionRecordModal() {
   selectedProductionRecordId = null;
-  isProductionActionMode = false;
+  isProductionEditMode = false;
+  productionEditDraft = null;
+  productionEditRecordId = null;
   document.querySelector(".production-detail-backdrop")?.remove();
 }
 
-function updateProductionStatus(recordId, status) {
+async function updateProductionStatus(recordId, status) {
   const record = (lineStore.productionRecords || []).find((item) => item.id === recordId);
   if (!record) return;
+
+  const changed = await changeProductionStatusFromApi(recordId, status);
+
+  if (changed !== null) return;
 
   record.status = status;
 
@@ -1554,7 +1729,127 @@ function updateProductionStatus(recordId, status) {
   }
 
   closeProductionRecordModal();
-  rerenderProducao();
+  rerenderProdução();
+}
+
+async function saveProductionEdit(recordId) {
+  const record = (lineStore.productionRecords || []).find((item) => item.id === recordId);
+  if (!record) return;
+
+  captureProductionEditDraft();
+  const draft = productionEditDraft || createProductionEditDraft(record);
+  const material = lineStore.materials.find((item) => item.name === draft.outputMaterialName);
+  const model = (material?.productionModels || []).find((item) => item.name === draft.productionModelName);
+  const machine = lineStore.machines.find((item) => item.name === draft.machineName);
+  const location = lineStore.locations.find((item) => item.name === draft.locationName);
+
+  try {
+    const updated = await apiPut(`/api/productions/${recordId}`, {
+      productionDate: draft.productionDate,
+      materialId: material?.id || record.outputMaterialId || null,
+      outputMaterialName: draft.outputMaterialName,
+      productionModelId: model?.id || record.productionModelId || null,
+      productionModelName: draft.productionModelName,
+      machineId: machine?.id || record.machineId || null,
+      machineName: draft.machineName,
+      locationId: location?.id || record.locationId || null,
+      locationName: draft.locationName,
+      operatorCodes: draft.operatorCodes,
+      consumedQuantity: Number(draft.consumedQuantity || 0),
+      consumedLot: {
+        lotId: draft.consumedLotId || null,
+        lotCode: draft.consumedLotCode,
+        quantity: Number(draft.consumedQuantity || 0)
+      },
+      outputLots: draft.outputLots.map((lot) => ({
+        id: lot.id || null,
+        lotId: lot.lotId || null,
+        lotCode: lot.lotCode,
+        quantity: Number(lot.quantity || 0),
+        secondaryQuantity: Number(lot.secondaryQuantity || 0),
+        status: lot.status || lot.lotStatus || ""
+      })),
+      observation: draft.observation
+    });
+
+    await reloadProductionFromApi();
+    closeProductionRecordModal();
+    openProductionRecordModal(updated.id, false);
+    refreshProductionHistoryResults();
+  } catch (error) {
+    if (shouldUseLocalFallback(error)) {
+      record.productionDate = draft.productionDate;
+      record.locationName = draft.locationName;
+      record.outputMaterialName = draft.outputMaterialName;
+      record.productionModelName = draft.productionModelName;
+      record.machineName = draft.machineName;
+      record.observation = draft.observation;
+      record.responsibleCodes = draft.operatorCodes;
+      record.responsibleName = draft.operatorCodes.map((code) => {
+        const operator = (lineStore.operators || []).find((item) => item.code === code);
+        return operator?.name || code;
+      }).join(" / ");
+      openProductionRecordModal(recordId, false);
+      refreshProductionHistoryResults();
+      return;
+    }
+
+    productionNotice = {
+      type: "danger",
+      title: "Produção nao editada",
+      message: error.message
+    };
+    closeProductionRecordModal();
+    rerenderProdução();
+  }
+}
+
+async function changeProductionStatusFromApi(recordId, status) {
+  const action = status === "Cancelado" ? "cancel" : "reprocess";
+
+  try {
+    await apiPost(`/api/productions/${recordId}/${action}`, {});
+    await reloadProductionFromApi();
+    closeProductionRecordModal();
+    rerenderProdução();
+    return true;
+  } catch (error) {
+    if (shouldUseLocalFallback(error)) {
+      console.log("API indisponivel, alterando status da produção localmente");
+      return null;
+    }
+
+    showProductionBlockingAlert(
+      status === "Cancelado" ? "Produção não cancelada" : "Reprocessamento negado",
+      getProductionStatusErrorMessage(error, status)
+    );
+    return false;
+  }
+}
+
+async function changeProductionOutputLotStatusFromApi(recordId, outputLot, action) {
+  try {
+    const updated = await apiPost(`/api/productions/${recordId}/output-lots/${outputLot.lotId || outputLot.id}/${action}`, {});
+    await reloadProductionFromApi();
+    productionEditRecordId = null;
+    productionEditDraft = null;
+    closeProductionOutputLotWarning();
+    openProductionRecordModal(updated?.id || recordId, true);
+    refreshProductionHistoryResults();
+    return true;
+  } catch (error) {
+    if (shouldUseLocalFallback(error)) {
+      console.log("API indisponivel, lote produzido nao alterado localmente");
+      return null;
+    }
+
+    closeProductionOutputLotWarning();
+    showProductionBlockingAlert(
+      action === "cancel" ? "Lote não cancelado" : "Reprocessamento negado",
+      getOutputLotStatusErrorMessage(error, action)
+    );
+    return false;
+  }
 }
 
 function openProductionStatusWarning(recordId, status) {
@@ -1574,18 +1869,86 @@ function openProductionStatusWarning(recordId, status) {
   });
 
   modal.querySelector("#cancelProductionStatusWarningBtn")?.addEventListener("click", closeProductionStatusWarning);
-  confirmBtn?.addEventListener("click", () => {
+  confirmBtn?.addEventListener("click", async () => {
     if (!productionStatusAction) return;
 
     const action = productionStatusAction;
     closeProductionStatusWarning();
-    updateProductionStatus(action.recordId, action.status);
+    await updateProductionStatus(action.recordId, action.status);
   });
 }
 
 function closeProductionStatusWarning() {
   productionStatusAction = null;
   document.querySelector(".production-status-warning-backdrop")?.remove();
+}
+
+function openProductionOutputLotWarning(recordId, outputLot, action) {
+  productionOutputLotAction = { recordId, outputLot, action };
+  document.querySelector(".production-output-lot-warning-backdrop")?.remove();
+
+  const modal = document.createElement("div");
+  modal.className = "modal-backdrop open danger-backdrop production-output-lot-warning-backdrop";
+  modal.innerHTML = renderProductionOutputLotWarning(outputLot, action);
+  document.getElementById("appContent").appendChild(modal);
+
+  const awareInput = modal.querySelector("#productionOutputLotAwareInput");
+  const confirmBtn = modal.querySelector("#confirmProductionOutputLotBtn");
+
+  awareInput?.addEventListener("change", () => {
+    confirmBtn.disabled = !awareInput.checked;
+  });
+
+  modal.querySelector("#cancelProductionOutputLotWarningBtn")?.addEventListener("click", closeProductionOutputLotWarning);
+  confirmBtn?.addEventListener("click", async () => {
+    if (!productionOutputLotAction) return;
+
+    const currentAction = productionOutputLotAction;
+    await changeProductionOutputLotStatusFromApi(currentAction.recordId, currentAction.outputLot, currentAction.action);
+  });
+}
+
+function closeProductionOutputLotWarning() {
+  productionOutputLotAction = null;
+  document.querySelector(".production-output-lot-warning-backdrop")?.remove();
+}
+
+function renderProductionOutputLotWarning(outputLot, action) {
+  const isCancel = action === "cancel";
+
+  return `
+    <div class="modal danger-modal">
+      <div class="delete-alert-icon">⚠️</div>
+
+      <div class="modal-header vertical">
+        <div>
+          <h2>${isCancel ? "Cancelar lote produzido" : "Reprocessar lote produzido"}</h2>
+          <p>
+            ${isCancel
+              ? `O lote ${outputLot.lotCode} sera removido do saldo e a quantidade sera devolvida ao lote consumido.`
+              : `O lote ${outputLot.lotCode} voltara ao saldo e a quantidade sera baixada do lote consumido.`}
+          </p>
+        </div>
+      </div>
+
+      <div class="danger-warning-box">
+        <strong>Atenção:</strong>
+        <span>Essa ação altera estoque e rastreabilidade apenas deste lote produzido.</span>
+      </div>
+
+      <label class="aware-check">
+        <input id="productionOutputLotAwareInput" type="checkbox" />
+        Estou ciente do impacto parcial no estoque e desejo continuar.
+      </label>
+
+      <div class="modal-footer">
+        <button class="secondary-btn" id="cancelProductionOutputLotWarningBtn" type="button">Voltar</button>
+        <button class="${isCancel ? "danger-btn" : "success-btn"}" id="confirmProductionOutputLotBtn" type="button" disabled>
+          ${isCancel ? "Confirmar cancelamento" : "Confirmar reprocessamento"}
+        </button>
+      </div>
+    </div>
+  `;
 }
 
 function renderProductionStatusWarning(status) {
@@ -1644,7 +2007,7 @@ function renderProductionRecordModal(record) {
       </div>
 
       <div class="movement-detail-grid">
-        <div><small>Data</small><strong>${formatDateOnly(record.productionDate)}</strong></div>
+        <div><small>Data</small><strong>${formatDateTime(record.createdAt || record.productionDate)}</strong></div>
         <div><small>Status</small><strong>${record.status}</strong></div>
         <div><small>Local</small><strong>${record.locationName || "-"}</strong></div>
         <div><small>Material produzido</small><strong>${record.outputMaterialName || "-"}</strong></div>
@@ -1654,7 +2017,9 @@ function renderProductionRecordModal(record) {
       </div>
 
       ${renderConsumedLotsReadOnly(consumedItems)}
-      ${renderGeneratedLotsReadOnly(generatedLots, record)}
+      ${renderGeneratedLotsReadOnly(generatedLots, record, "production-detail-output-lots")}
+
+      ${isProductionEditMode ? renderProductionEditFields(record) : ""}
 
       ${
         record.observation
@@ -1663,16 +2028,324 @@ function renderProductionRecordModal(record) {
       }
 
       <div class="modal-footer between">
-        <button id="closeProductionDetailFooterBtn" class="secondary-btn" type="button">Fechar</button>
+        <button id="closeProductionDetailFooterBtn" class="secondary-btn" type="button">${isProductionEditMode ? "Cancelar edição" : "Fechar"}</button>
 
         <div class="modal-footer-actions">
-          ${!isProductionActionMode ? `<button id="editProductionBtn" class="secondary-btn" type="button">Editar</button>` : ""}
+          ${renderProductionRecordActions(record)}
+        </div>
+      </div>
+    </div>
+  `;
+}
 
-          ${isProductionActionMode ? (
-            record.status === "Cancelado"
-              ? `<button id="reprocessProductionBtn" class="success-btn" type="button">Reprocessar</button>`
-              : `<button id="cancelProductionBtn" class="danger-btn" type="button">Cancelar produção</button>`
-          ) : ""}
+function renderProductionRecordActions(record) {
+  if (!isProductionEditMode) {
+    return `
+      <button id="editProductionBtn" class="secondary-btn" type="button">Editar</button>
+      ${
+        record.status === "Cancelado"
+          ? `<button id="reprocessProductionBtn" class="success-btn" type="button">Reprocessar</button>`
+          : ""
+      }
+    `;
+  }
+
+  return `
+    <button id="saveProductionEditBtn" class="primary-btn" type="button">Salvar edição</button>
+    ${record.status === "Cancelado" ? "" : `<button id="cancelProductionBtn" class="danger-btn" type="button">Cancelar produção</button>`}
+  `;
+}
+
+function createProductionEditDraft(record) {
+  const consumedItem = getConsumedItemsByRecord(record.id)[0] || record.consumedItems?.[0] || {};
+  const consumedLot = consumedItem.consumedLots?.[0] || {};
+  const outputLots = getGeneratedLotsByRecord(record.id);
+
+  return {
+    productionDate: record.productionDate || getToday(),
+    locationName: record.locationName || "",
+    outputMaterialName: record.outputMaterialName || "",
+    productionModelName: record.productionModelName || "",
+    machineName: record.machineName || "",
+    operatorCodes: Array.isArray(record.responsibleCodes) ? [...record.responsibleCodes] : [],
+    consumedLotId: consumedLot.sourceLotId || consumedLot.lotId || "",
+    consumedLotCode: consumedLot.lotCode || "",
+    consumedQuantity: consumedLot.quantity || consumedItem.requiredQuantity || "",
+    observation: record.observation || "",
+    outputLots: outputLots.length
+      ? outputLots.map((lot) => ({
+          id: lot.id || "",
+          lotId: lot.lotId || lot.id || "",
+          lotCode: lot.lotCode || "",
+          quantity: lot.quantity || "",
+          secondaryQuantity: lot.secondaryQuantity || "",
+          status: lot.status || lot.lotStatus || ""
+        }))
+      : [{
+          id: "",
+          lotId: "",
+          lotCode: record.generatedLotCode || "",
+          quantity: record.outputQuantity || "",
+          secondaryQuantity: record.outputSecondaryQuantity || "",
+          status: ""
+        }]
+  };
+}
+
+function captureProductionEditDraft() {
+  if (!productionEditDraft) return;
+
+  const outputLotCards = Array.from(document.querySelectorAll("[data-edit-output-lot-index]"))
+    .filter((element) => element.classList.contains("production-lot-card"));
+  const capturedOutputLots = outputLotCards.length
+    ? outputLotCards.map((element) => {
+        const index = element.dataset.editOutputLotIndex;
+        const originalLot = productionEditDraft.outputLots[Number(index)] || {};
+        return {
+          id: originalLot.id || "",
+          lotId: originalLot.lotId || "",
+          lotCode: document.querySelector(`.production-edit-output-lot-code[data-edit-output-lot-index="${index}"]`)?.value || "",
+          quantity: document.querySelector(`.production-edit-output-lot-quantity[data-edit-output-lot-index="${index}"]`)?.value || "",
+          secondaryQuantity: document.querySelector(`.production-edit-output-lot-secondary[data-edit-output-lot-index="${index}"]`)?.value || "",
+          status: originalLot.status || originalLot.lotStatus || ""
+        };
+      })
+    : productionEditDraft.outputLots;
+  const consumedQuantity = capturedOutputLots
+    .filter((lot) => lot.status !== "Cancelado")
+    .reduce((sum, lot) => sum + Number(lot.quantity || 0), 0);
+
+  productionEditDraft = {
+    ...productionEditDraft,
+    productionDate: document.getElementById("productionEditDate")?.value || productionEditDraft.productionDate,
+    locationName: document.getElementById("productionEditLocation")?.value || productionEditDraft.locationName,
+    outputMaterialName: document.getElementById("productionEditOutputMaterial")?.value || productionEditDraft.outputMaterialName,
+    productionModelName: document.getElementById("productionEditModel")?.value || productionEditDraft.productionModelName,
+    machineName: document.getElementById("productionEditMachine")?.value || productionEditDraft.machineName,
+    consumedLotCode: document.getElementById("productionEditConsumedLot")?.value || productionEditDraft.consumedLotCode,
+    consumedQuantity,
+    observation: document.getElementById("productionEditObservation")?.value || "",
+    operatorCodes: Array.from(document.querySelectorAll(".production-edit-operator-checkbox:checked")).map((input) => input.value),
+    outputLots: capturedOutputLots
+  };
+
+  const selectedLot = getProductionEditConsumedLots(productionEditDraft, getModelConsumedInput(getProductionEditModel()), null)
+    .find((lot) => lot.lotCode === productionEditDraft.consumedLotCode);
+
+  productionEditDraft.consumedLotId = selectedLot?.lotId || selectedLot?.id || productionEditDraft.consumedLotId;
+}
+
+function setupProductionEditModalEvents(record) {
+  if (!isProductionEditMode) return;
+
+  ["productionEditDate", "productionEditLocation", "productionEditOutputMaterial", "productionEditModel", "productionEditMachine", "productionEditConsumedLot"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("change", () => {
+      captureProductionEditDraft();
+      if (id === "productionEditOutputMaterial") {
+        productionEditDraft.productionModelName = "";
+      }
+      openProductionRecordModal(record.id, true);
+    });
+  });
+
+  document.querySelectorAll(".production-edit-output-lot-quantity").forEach((input) => {
+    input.addEventListener("input", () => {
+      captureProductionEditDraft();
+      const consumedInput = document.getElementById("productionEditConsumedQuantity");
+      if (consumedInput) consumedInput.value = productionEditDraft.consumedQuantity || 0;
+    });
+  });
+
+  document.querySelectorAll(".production-edit-output-lot-code, .production-edit-output-lot-secondary").forEach((input) => {
+    input.addEventListener("input", captureProductionEditDraft);
+  });
+}
+
+function getProductionEditModel() {
+  const material = lineStore.materials.find((item) => item.name === productionEditDraft?.outputMaterialName);
+  return (material?.productionModels || []).find((item) => item.name === productionEditDraft?.productionModelName);
+}
+
+function renderGenericOptions(values, selectedValue) {
+  if (!values.length) return `<option value="">Nenhum item disponível</option>`;
+
+  return `
+    <option value="">Selecione</option>
+    ${values.map((value) => `
+      <option value="${value}" ${value === selectedValue ? "selected" : ""}>${value}</option>
+    `).join("")}
+  `;
+}
+
+function renderConsumedLotOptions(lots, selectedValue) {
+  if (!lots.length) return `<option value="">Nenhum lote disponível</option>`;
+
+  return `
+    <option value="">Selecione</option>
+    ${lots.map((lot) => `
+      <option value="${lot.lotCode}" ${lot.lotCode === selectedValue ? "selected" : ""}>
+        ${lot.lotCode} - ${formatNumber(lot.quantity)}
+      </option>
+    `).join("")}
+  `;
+}
+
+function getProductionEditConsumedLots(draft, consumedInput, record) {
+  const lots = [];
+  const seen = new Set();
+  const materialCode = consumedInput?.inputCode || "";
+  const snapshotLots = apiStockSnapshot?.lots || buildStockSnapshot(lineStore).lots || [];
+
+  snapshotLots.forEach((lot) => {
+    if (
+      (!materialCode || lot.balanceMaterialCode === materialCode) &&
+      (!draft.locationName || lot.locationName === draft.locationName) &&
+      Number(lot.availableQuantity ?? lot.quantity ?? 0) > 0
+    ) {
+      lots.push({
+        id: lot.id,
+        lotId: lot.lotId || lot.id,
+        lotCode: lot.lotCode,
+        quantity: Number(lot.availableQuantity ?? lot.quantity ?? 0)
+      });
+      seen.add(lot.lotCode);
+    }
+  });
+
+  const originalConsumed = (record ? getConsumedItemsByRecord(record.id)[0] : null)?.consumedLots?.[0];
+  if (originalConsumed?.lotCode && !seen.has(originalConsumed.lotCode)) {
+    lots.unshift({
+      id: originalConsumed.sourceLotId || originalConsumed.lotId,
+      lotId: originalConsumed.sourceLotId || originalConsumed.lotId,
+      lotCode: originalConsumed.lotCode,
+      quantity: Number(originalConsumed.quantity || 0)
+    });
+  }
+
+  return lots;
+}
+
+function renderProductionEditFields(record) {
+  const draft = productionEditDraft || createProductionEditDraft(record);
+  const material = lineStore.materials.find((item) => item.name === draft.outputMaterialName);
+  const model = (material?.productionModels || []).find((item) => item.name === draft.productionModelName);
+  const consumedInput = getModelConsumedInput(model);
+  const consumedLots = getProductionEditConsumedLots(draft, consumedInput, record);
+  const operators = getActiveItems(lineStore.operators || []);
+  const activeOutputLots = draft.outputLots.filter((lot) => lot.status !== "Cancelado");
+  const consumedQuantity = activeOutputLots.reduce((sum, lot) => sum + Number(lot.quantity || 0), 0);
+
+  return `
+    <div class="movement-detail-section production-edit-section">
+      <h3>Editar produção</h3>
+
+      <div class="form-grid">
+        <label>
+          Data
+          <input id="productionEditDate" type="date" value="${draft.productionDate || getToday()}" />
+        </label>
+
+        <label>
+          Local
+          <select id="productionEditLocation">
+            ${renderGenericOptions(getActiveItems(lineStore.locations || []).map((item) => item.name), draft.locationName)}
+          </select>
+        </label>
+
+        <label>
+          Material produzido
+          <select id="productionEditOutputMaterial">
+            ${renderGenericOptions(getActiveItems(lineStore.materials || []).filter((item) => item.canBeProduced).map((item) => item.name), draft.outputMaterialName)}
+          </select>
+        </label>
+
+        <label>
+          Modelo
+          <select id="productionEditModel">
+            ${renderGenericOptions((material?.productionModels || []).map((item) => item.name), draft.productionModelName)}
+          </select>
+        </label>
+
+        <label>
+          Máquina
+          <select id="productionEditMachine">
+            ${renderGenericOptions(getActiveItems(lineStore.machines || []).map((item) => item.name), draft.machineName)}
+          </select>
+        </label>
+
+        <label>
+          Lote consumido
+          <select id="productionEditConsumedLot">
+            ${renderConsumedLotOptions(consumedLots, draft.consumedLotCode)}
+          </select>
+        </label>
+
+        <label>
+          Quantidade consumida
+          <input id="productionEditConsumedQuantity" type="number" min="0" step="0.001" value="${consumedQuantity || 0}" readonly />
+        </label>
+      </div>
+
+      <label class="full-field production-edit-observation-label">
+        Observação
+        <textarea id="productionEditObservation" class="production-observation-field">${draft.observation || ""}</textarea>
+      </label>
+
+      <div class="movement-detail-section">
+        <h3>Lotes produzidos</h3>
+        <div class="production-edit-output-lots">
+          ${draft.outputLots.map((lot, index) => `
+            <div class="production-lot-card production-edit-output-card ${lot.status === "Cancelado" ? "is-canceled" : ""}" data-edit-output-lot-index="${index}">
+              <div class="production-lot-card-header">
+                <div>
+                  <h4>Lote produzido ${index + 1}</h4>
+                  <p>${lot.lotCode || "-"}</p>
+                </div>
+                <div class="production-output-lot-actions">
+                  <span class="badge ${lot.status === "Cancelado" ? "badge-danger" : "badge-success"}">${lot.status === "Cancelado" ? "Cancelado" : "Ativo"}</span>
+                  ${
+                    lot.status === "Cancelado"
+                      ? `<button class="success-btn production-output-lot-status-btn" data-output-lot-action="reprocess" data-output-lot-id="${lot.lotId || lot.id}" type="button">Reprocessar lote</button>`
+                      : `<button class="danger-btn production-output-lot-status-btn" data-output-lot-action="cancel" data-output-lot-id="${lot.lotId || lot.id}" type="button" ${activeOutputLots.length <= 1 ? "disabled title=\"Use Cancelar produção para cancelar o último lote ativo.\"" : ""}>Cancelar lote</button>`
+                  }
+                </div>
+              </div>
+
+              <div class="production-edit-output-grid">
+                <label>
+                  Código do lote
+                  <input class="production-edit-output-lot-code" data-edit-output-lot-index="${index}" type="text" value="${lot.lotCode || ""}" ${lot.status === "Cancelado" ? "disabled" : ""} />
+                </label>
+
+                <label>
+                  Quantidade principal
+                  <input class="production-edit-output-lot-quantity" data-edit-output-lot-index="${index}" type="number" min="0" step="0.001" value="${lot.quantity || ""}" ${lot.status === "Cancelado" ? "disabled" : ""} />
+                </label>
+
+                <label>
+                  Quantidade secundária
+                  <input class="production-edit-output-lot-secondary" data-edit-output-lot-index="${index}" type="number" min="0" step="0.001" value="${lot.secondaryQuantity || ""}" ${lot.status === "Cancelado" ? "disabled" : ""} />
+                </label>
+              </div>
+            </div>
+          `).join("")}
+        </div>
+      </div>
+
+      <div class="production-edit-operators-section">
+        <h3>Operadores</h3>
+        <div class="checkbox-grid production-operator-grid">
+          ${operators.map((operator) => `
+            <label>
+              <input
+                class="production-edit-operator-checkbox"
+                type="checkbox"
+                value="${operator.code}"
+                ${draft.operatorCodes.includes(operator.code) ? "checked" : ""}
+              />
+              ${operator.name}
+            </label>
+          `).join("")}
         </div>
       </div>
     </div>
@@ -1715,7 +2388,7 @@ function renderConsumedLotsReadOnly(items) {
   `;
 }
 
-function renderGeneratedLotsReadOnly(lots, record) {
+function renderGeneratedLotsReadOnly(lots, record, extraClass = "") {
   const displayLots = lots.length
     ? lots
     : [{
@@ -1727,7 +2400,7 @@ function renderGeneratedLotsReadOnly(lots, record) {
       }];
 
   return `
-    <div class="movement-detail-section">
+    <div class="movement-detail-section ${extraClass}">
       <h3>Lotes produzidos</h3>
       <div class="data-table-wrap">
         <table class="data-table">
@@ -1741,9 +2414,12 @@ function renderGeneratedLotsReadOnly(lots, record) {
           <tbody>
             ${displayLots.map((lot) => `
               <tr>
-                <td><strong>${lot.lotCode || "-"}</strong></td>
-                <td>${formatNumber(lot.quantity)} ${lot.unit || record.outputUnit || ""}</td>
-                <td>${lot.secondaryUnit || record.outputSecondaryUnit ? `${formatNumber(lot.secondaryQuantity)} ${lot.secondaryUnit || record.outputSecondaryUnit}` : "-"}</td>
+                <td>
+                  <strong class="${isProductionLotCanceled(lot) ? "production-canceled-value" : ""}">${lot.lotCode || "-"}</strong>
+                  ${isProductionLotCanceled(lot) ? `<span class="badge badge-danger production-lot-status-badge">Cancelado</span>` : ""}
+                </td>
+                <td><span class="${isProductionLotCanceled(lot) ? "production-canceled-value" : ""}">${formatNumber(lot.quantity)} ${lot.unit || record.outputUnit || ""}</span></td>
+                <td><span class="${isProductionLotCanceled(lot) ? "production-canceled-value" : ""}">${lot.secondaryUnit || record.outputSecondaryUnit ? `${formatNumber(lot.secondaryQuantity)} ${lot.secondaryUnit || record.outputSecondaryUnit}` : "-"}</span></td>
               </tr>
             `).join("")}
           </tbody>
@@ -1757,6 +2433,236 @@ function getConsumedItemsByRecord(recordId) {
   return (lineStore.productionRecordItems || []).filter((item) => {
     return item.productionRecordId === recordId;
   });
+}
+
+async function loadProductionPageFromApi(force = false) {
+  if (hasLoadedProductionApi && !force) return;
+
+  hasLoadedProductionApi = true;
+  await Promise.all([
+    loadProductionReferencesFromApi(),
+    reloadProductionFromApi()
+  ]);
+}
+
+async function loadProductionReferencesFromApi() {
+  try {
+    const [materials, locations, machines, operators, stock] = await Promise.all([
+      apiGet("/api/materials"),
+      apiGet("/api/locations"),
+      apiGet("/api/machines"),
+      apiGet("/api/operators"),
+      apiGet("/api/stock")
+    ]);
+
+    lineStore.materials.splice(0, lineStore.materials.length, ...materials.map(normalizeApiMaterial).filter(isActiveItem));
+    lineStore.locations.splice(0, lineStore.locations.length, ...locations.map(normalizeApiLocation).filter(isActiveItem));
+    lineStore.machines.splice(0, lineStore.machines.length, ...machines.map(normalizeApiMachine).filter(isActiveItem));
+    lineStore.operators.splice(0, lineStore.operators.length, ...operators.map(normalizeApiOperator).filter(isActiveItem));
+    apiStockSnapshot = normalizeApiStockSnapshot(stock);
+  } catch (error) {
+    if (!shouldUseLocalFallback(error)) {
+      productionNotice = {
+        type: "danger",
+        title: "Dados nao carregados",
+        message: error.message
+      };
+      showProductionNotice();
+      return;
+    }
+
+    console.log("API indisponivel, usando dados locais de produção");
+  }
+}
+
+async function reloadProductionFromApi() {
+  try {
+    const [productions, stock] = await Promise.all([
+      apiGet("/api/productions"),
+      apiGet("/api/stock")
+    ]);
+
+    const normalized = productions.map(normalizeApiProduction);
+    lineStore.productionRecords.splice(0, lineStore.productionRecords.length, ...normalized);
+    lineStore.productionGeneratedLots.splice(0, lineStore.productionGeneratedLots.length);
+    lineStore.productionRecordItems.splice(0, lineStore.productionRecordItems.length);
+
+    normalized.forEach((production) => {
+      (production.producedLots || []).forEach((lot) => lineStore.productionGeneratedLots.unshift(lot));
+      (production.consumedItems || []).forEach((item) => lineStore.productionRecordItems.unshift(item));
+    });
+
+    apiStockSnapshot = normalizeApiStockSnapshot(stock);
+  } catch (error) {
+    if (!shouldUseLocalFallback(error)) {
+      productionNotice = {
+        type: "danger",
+        title: "Histórico nao carregado",
+        message: error.message
+      };
+      showProductionNotice();
+      return;
+    }
+
+    console.log("API indisponivel, usando histórico local de produção");
+  }
+}
+
+async function createProductionFromApi(payload) {
+  const { record, producedLots: lots, consumedInput, consumedLot, consumedQuantity } = payload;
+  const material = getSelectedOutputMaterial();
+  const model = getSelectedProductionModel();
+  const machine = getSelectedProductionMachine();
+
+  try {
+    const saved = await apiPost("/api/productions", {
+      productionDate: record.productionDate,
+      materialId: material?.id || null,
+      outputMaterialName: record.outputMaterialName,
+      productionModelId: model?.id || null,
+      productionModelName: record.productionModelName,
+      machineId: machine?.id || null,
+      machineName: record.machineName,
+      locationName: record.locationName,
+      operatorCodes: record.responsibleCodes || [],
+      consumedQuantity,
+      consumedLot: {
+        lotId: consumedLot.lotId || consumedLot.id,
+        lotCode: consumedLot.lotCode,
+        quantity: consumedQuantity
+      },
+      outputLots: lots.map((lot) => ({
+        lotCode: lot.lotCode,
+        quantity: lot.outputQuantity,
+        secondaryQuantity: lot.outputSecondaryQuantity
+      })),
+      observation: record.observation,
+      notes: record.observation || ""
+    });
+
+    return normalizeApiProduction(saved);
+  } catch (error) {
+    if (shouldUseLocalFallback(error)) {
+      console.log("API indisponivel, registrando produção localmente");
+      return null;
+    }
+
+    productionNotice = {
+      type: "danger",
+      title: "Produção nao registrada",
+      message: error.message
+    };
+    closeProductionConfirmModal();
+    rerenderProdução();
+    return false;
+  }
+}
+
+function normalizeApiProduction(production) {
+  return {
+    id: production.id,
+    productionDate: production.productionDate,
+    dateTime: production.dateTime || `${production.productionDate}T00:00:00`,
+    locationId: production.locationId || "",
+    locationName: production.locationName || "",
+    outputMaterialId: production.outputMaterialId || "",
+    outputMaterialName: production.outputMaterialName || "",
+    outputMaterialCode: production.outputMaterialCode || "",
+    outputMaterialType: production.outputMaterialType || "",
+    outputUnit: production.outputUnit || "un",
+    outputSecondaryUnit: production.outputSecondaryUnit || "",
+    productionModelId: production.productionModelId || "",
+    productionModelName: production.productionModelName || "",
+    machineId: production.machineId || "",
+    machineName: production.machineName || "",
+    responsibleName: production.responsibleName || "",
+    responsibleCodes: Array.isArray(production.responsibleCodes) ? production.responsibleCodes : [],
+    outputQuantity: Number(production.outputQuantity || 0),
+    outputSecondaryQuantity: Number(production.outputSecondaryQuantity || 0),
+    generatedLotCode: production.generatedLotCode || "",
+    observation: production.observation || production.notes || "",
+    status: production.status || "Processado",
+    createdAt: production.createdAt,
+    updatedAt: production.updatedAt,
+    consumedItems: Array.isArray(production.consumedItems) ? production.consumedItems : [],
+    producedLots: Array.isArray(production.producedLots) ? production.producedLots.map((lot) => ({
+      ...lot,
+      productionRecordId: production.id,
+      quantity: Number(lot.quantity || 0),
+      secondaryQuantity: Number(lot.secondaryQuantity || 0)
+    })) : []
+  };
+}
+
+function normalizeApiMaterial(material) {
+  return {
+    ...material,
+    unit: material.unit || material.primaryUnit || "un",
+    secondaryUnit: material.secondaryUnit || "",
+    lotCode: material.lotCode || "",
+    canBeProduced: Boolean(material.canBeProduced || material.producible),
+    productionMachines: Array.isArray(material.productionMachines) ? material.productionMachines : [],
+    productionModels: Array.isArray(material.productionModels) ? material.productionModels.map((model) => ({
+      ...model,
+      inputs: Array.isArray(model.inputs) ? model.inputs : []
+    })) : [],
+    status: material.status || "Ativo"
+  };
+}
+
+function normalizeApiLocation(location) {
+  return {
+    id: location.id,
+    name: location.name || "",
+    code: location.code || "",
+    production: Boolean(location.production),
+    storage: Boolean(location.storage),
+    status: location.status || "Ativo"
+  };
+}
+
+function normalizeApiMachine(machine) {
+  return {
+    id: machine.id,
+    name: machine.name || "",
+    code: machine.code || "",
+    lotCode: machine.lotCode || machine.lot_code || "",
+    status: machine.status || "Ativo"
+  };
+}
+
+function normalizeApiOperator(operator) {
+  return {
+    id: operator.id,
+    name: operator.name || "",
+    code: operator.code || "",
+    status: operator.status || "Ativo"
+  };
+}
+
+function normalizeApiStockSnapshot(snapshot) {
+  return {
+    groups: Array.isArray(snapshot?.groups) ? snapshot.groups : [],
+    lots: Array.isArray(snapshot?.lots) ? snapshot.lots.map((lot) => ({
+      id: lot.lotId || lot.id,
+      lotId: lot.lotId || lot.id,
+      balanceMaterialCode: lot.balanceMaterialCode || lot.materialCode || "",
+      materialName: lot.materialName || "",
+      locationName: lot.locationName || "",
+      lotCode: lot.lotCode || "",
+      quantity: Number(lot.quantity || 0),
+      secondaryQuantity: Number(lot.secondaryQuantity || 0),
+      availableQuantity: Number(lot.availableQuantity ?? lot.quantity ?? 0)
+    })) : []
+  };
+}
+
+function shouldUseLocalFallback(error) {
+  return !error.status;
+}
+
+function isActiveItem(item) {
+  return item.status !== "Inativo";
 }
 
 function getToday() {
@@ -1780,17 +2686,31 @@ function formatNumber(value) {
   });
 }
 
-function rerenderProducao() {
+function formatDateTime(value) {
+  if (!value) return "-";
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) return "-";
+
+  return `${date.toLocaleDateString("pt-BR")} ${date.toLocaleTimeString("pt-BR", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  })}`;
+}
+
+function rerenderProdução() {
   const content = document.getElementById("appContent");
 
   content.innerHTML = `
     <div class="page-header">
-      <h1>${producaoPage.title}</h1>
-      <p>${producaoPage.subtitle}</p>
+      <h1>${produçãoPage.title}</h1>
+      <p>${produçãoPage.subtitle}</p>
     </div>
 
-    ${producaoPage.render()}
+    ${produçãoPage.render()}
   `;
 
-  setupProducaoEvents();
+  setupProduçãoEvents();
 }
