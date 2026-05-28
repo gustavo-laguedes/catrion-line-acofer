@@ -43,63 +43,25 @@ function toNumber(value) {
   return Number.isFinite(number) ? number : 0;
 }
 
-async function ensureExpeditionSchema(client) {
-  await client.query('create extension if not exists "uuid-ossp";');
+function isMissingSchemaError(error) {
+  return ["3F000", "42P01", "42703"].includes(error?.code);
+}
 
-  await client.query(`
-    create table if not exists expeditions (
-      id uuid primary key default uuid_generate_v4(),
-      date_time timestamptz not null default now(),
-      location_id uuid references locations(id),
-      vehicle_id text,
-      vehicle_name text,
-      status text not null default 'Processado' check (status in ('Processado', 'Cancelado', 'Reprocessado')),
-      notes text,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    );
-  `);
+function handleExpeditionError(error, res, action, fallbackMessage = INTERNAL_ERROR.error) {
+  if (isMissingSchemaError(error)) {
+    console.error(`Schema ausente ou incompatível ao ${action} expedições:`, {
+      code: error.code,
+      message: error.message,
+      table: error.table,
+      column: error.column
+    });
+    return res.status(503).json({
+      error: "Estrutura de banco ausente ou incompatível para expedições."
+    });
+  }
 
-  await client.query(`
-    create table if not exists expedition_orders (
-      id uuid primary key default uuid_generate_v4(),
-      expedition_id uuid not null references expeditions(id) on delete cascade,
-      order_number text not null,
-      notes text,
-      sequence integer not null default 1
-    );
-  `);
-
-  await client.query(`
-    create table if not exists expedition_materials (
-      id uuid primary key default uuid_generate_v4(),
-      expedition_order_id uuid not null references expedition_orders(id) on delete cascade,
-      material_id uuid references materials(id),
-      material_code text,
-      material_name text not null,
-      sequence integer not null default 1
-    );
-  `);
-
-  await client.query(`
-    create table if not exists expedition_lots (
-      id uuid primary key default uuid_generate_v4(),
-      expedition_material_id uuid not null references expedition_materials(id) on delete cascade,
-      lot_id uuid not null references lots(id),
-      lot_code text not null,
-      location_id uuid references locations(id),
-      primary_quantity numeric(14,6) not null,
-      primary_unit text,
-      secondary_quantity numeric(14,6),
-      secondary_unit text,
-      created_at timestamptz not null default now()
-    );
-  `);
-
-  await client.query("create index if not exists idx_expeditions_date_time on expeditions(date_time desc);");
-  await client.query("create index if not exists idx_expedition_orders_expedition on expedition_orders(expedition_id);");
-  await client.query("create index if not exists idx_expedition_materials_order on expedition_materials(expedition_order_id);");
-  await client.query("create index if not exists idx_expedition_lots_material on expedition_lots(expedition_material_id);");
+  console.error(`Erro ao ${action} expedições:`, error);
+  return res.status(500).json({ error: fallbackMessage });
 }
 
 async function resolveLocation(client, locationId, locationName) {
@@ -754,7 +716,6 @@ async function changeExpeditionStatus(req, res, nextStatus, action) {
 
   try {
     await client.query("begin");
-    await ensureExpeditionSchema(client);
 
     const expedition = await getExpeditionForStatusChange(client, req.params.id);
     if (!expedition) {
@@ -818,6 +779,8 @@ async function changeExpeditionStatus(req, res, nextStatus, action) {
     return res.json(updatedExpedition);
   } catch (error) {
     await client.query("rollback");
+    if (isMissingSchemaError(error)) return handleExpeditionError(error, res, "alterar status de");
+
     console.error("Erro ao alterar status da expedição:", error);
     return res.status(error.status || 500).json({
       error: error.status ? error.message : "Erro interno ao alterar status da expedição.",
@@ -832,8 +795,6 @@ router.get("/", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await ensureExpeditionSchema(client);
-
     const result = await client.query(`
       select id
       from expeditions
@@ -847,8 +808,7 @@ router.get("/", async (req, res) => {
 
     return res.json(expeditions.filter(Boolean));
   } catch (error) {
-    console.error("Erro ao listar expedições:", error);
-    return res.status(500).json(INTERNAL_ERROR);
+    return handleExpeditionError(error, res, "listar");
   } finally {
     client.release();
   }
@@ -859,7 +819,6 @@ router.post("/", async (req, res) => {
 
   try {
     await client.query("begin");
-    await ensureExpeditionSchema(client);
 
     const payload = await normalizePayload(client, req.body || {});
 
@@ -968,6 +927,8 @@ router.post("/", async (req, res) => {
     return res.status(201).json(expedition);
   } catch (error) {
     await client.query("rollback");
+    if (isMissingSchemaError(error)) return handleExpeditionError(error, res, "registrar");
+
     console.error("Erro ao registrar expedição:", {
       message: error.message,
       detail: error.detail,
@@ -998,8 +959,6 @@ router.get("/:id/certificates", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await ensureExpeditionSchema(client);
-
     const expedition = await getExpeditionById(client, req.params.id);
     if (!expedition) return res.status(404).json({ error: "Expedição não encontrada." });
 
@@ -1069,8 +1028,7 @@ router.get("/:id/certificates", async (req, res) => {
       relations: foundCertificates.map((item) => item.relation)
     });
   } catch (error) {
-    console.error("Erro ao consultar certificados da expedição:", error);
-    return res.status(500).json(INTERNAL_ERROR);
+    return handleExpeditionError(error, res, "consultar certificados de");
   } finally {
     client.release();
   }

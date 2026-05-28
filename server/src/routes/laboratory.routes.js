@@ -2,6 +2,10 @@ const express = require("express");
 const { pool, query } = require("../db");
 
 const router = express.Router();
+const SCHEMA_ERROR = {
+  error: "Schema do laboratorio ausente ou incompativel. Execute as migrations/baseline antes de usar este endpoint."
+};
+const SCHEMA_ERROR_CODES = new Set(["42P01", "42703", "42883", "42P07"]);
 const INTERNAL_ERROR = { error: "Erro interno ao processar laboratório." };
 
 function normalizeText(value) {
@@ -30,48 +34,27 @@ function toDateOnly(value) {
   return String(value).slice(0, 10);
 }
 
-async function ensureLaboratorySchema(client) {
-  await client.query('create extension if not exists "uuid-ossp"');
-  await client.query("alter table stock_movements add column if not exists supplier_certificate_number text");
-  await client.query("alter table stock_movement_lots add column if not exists supplier_certificate_number text");
-  await client.query("alter table lots add column if not exists supplier_certificate_number text");
-  await client.query(`
-    create table if not exists laboratory_tests (
-      id uuid primary key default uuid_generate_v4(),
-      lot_id uuid not null references lots(id),
-      material_id uuid references materials(id),
-      material_type_id uuid references material_types(id),
-      supplier_id uuid references suppliers(id),
-      technical_parameter_id uuid references technical_parameters(id),
-      test_date date not null,
-      tested_at timestamptz not null default now(),
-      nominal_value numeric,
-      nominal_unit text,
-      measured_specific_weight numeric,
-      variation_percent numeric,
-      tolerance_min_percent numeric,
-      tolerance_max_percent numeric,
-      apparent_diameter numeric,
-      yield_strength_le numeric,
-      tensile_strength_lr numeric,
-      ratio_lr_le numeric,
-      elongation_percent numeric,
-      certificate_code text unique,
-      supplier_certificate_number text,
-      certificate_file_name text not null,
-      certificate_file_url text,
-      status text not null default 'Aprovado',
-      notes text,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now(),
-      canceled_at timestamptz,
-      cancel_reason text
-    );
-  `);
-  await client.query("alter table laboratory_tests add column if not exists elongation_percent numeric");
-  await client.query("alter table laboratory_tests add column if not exists certificate_code text");
-  await client.query("create index if not exists idx_laboratory_tests_lot on laboratory_tests(lot_id)");
-  await client.query("create index if not exists idx_laboratory_tests_material on laboratory_tests(material_id)");
+function isSchemaError(error) {
+  return SCHEMA_ERROR_CODES.has(error?.code);
+}
+
+function logLaboratoryError(route, step, error) {
+  console.error("Erro ao processar laboratorio:", {
+    route,
+    step,
+    code: error?.code,
+    message: error?.message,
+    detail: error?.detail,
+    constraint: error?.constraint
+  });
+}
+
+function sendLaboratoryError(res, route, step, error, fallbackStatus = 500, fallbackBody = INTERNAL_ERROR) {
+  logLaboratoryError(route, step, error);
+  if (isSchemaError(error)) {
+    return res.status(503).json(SCHEMA_ERROR);
+  }
+  return res.status(fallbackStatus).json(fallbackBody);
 }
 
 function calculateValues(payload) {
@@ -230,7 +213,6 @@ router.get("/lots", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await ensureLaboratorySchema(client);
     const result = await client.query(`
       with latest_purchase as (
         select distinct on (sml.lot_id)
@@ -298,8 +280,7 @@ router.get("/lots", async (req, res) => {
       totalTests: Number(row.totalTests || 0)
     })));
   } catch (error) {
-    console.error("Erro ao listar lotes para laboratório:", error);
-    return res.status(500).json(INTERNAL_ERROR);
+    return sendLaboratoryError(res, "GET /lots", "list_lots", error);
   } finally {
     client.release();
   }
@@ -309,15 +290,13 @@ router.get("/lots/:lotId/tests", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await ensureLaboratorySchema(client);
     const result = await client.query(
       `${testSelect} where lt.lot_id = $1 order by lt.tested_at desc, lt.created_at desc`,
       [req.params.lotId]
     );
     return res.json(result.rows.map(normalizeTest));
   } catch (error) {
-    console.error("Erro ao listar ensaios do lote:", error);
-    return res.status(500).json(INTERNAL_ERROR);
+    return sendLaboratoryError(res, "GET /lots/:lotId/tests", "list_lot_tests", error);
   } finally {
     client.release();
   }
@@ -327,7 +306,6 @@ router.post("/tests", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await ensureLaboratorySchema(client);
     const payload = req.body || {};
     const lotId = normalizeText(payload.lotId);
     const certificateCode = normalizeText(payload.certificateCode);
@@ -394,10 +372,16 @@ router.post("/tests", async (req, res) => {
 
     return res.status(201).json(await getTestById(client, result.rows[0].id));
   } catch (error) {
-    console.error("Erro ao criar ensaio laboratorial:", error);
-    return res.status(error.code === "23505" ? 409 : 500).json({
-      error: error.code === "23505" ? "Código de certificado já existe. Tente salvar novamente." : INTERNAL_ERROR.error
-    });
+    return sendLaboratoryError(
+      res,
+      "POST /tests",
+      "create_test",
+      error,
+      error.code === "23505" ? 409 : 500,
+      {
+        error: error.code === "23505" ? "C\u00f3digo de certificado j\u00e1 existe. Tente salvar novamente." : INTERNAL_ERROR.error
+      }
+    );
   } finally {
     client.release();
   }
@@ -407,7 +391,6 @@ router.put("/tests/:id", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await ensureLaboratorySchema(client);
     const payload = req.body || {};
     const certificateCode = normalizeText(payload.certificateCode);
     const values = calculateValues(payload);
@@ -474,10 +457,16 @@ router.put("/tests/:id", async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: "Ensaio não encontrado." });
     return res.json(await getTestById(client, req.params.id));
   } catch (error) {
-    console.error("Erro ao editar ensaio laboratorial:", error);
-    return res.status(error.code === "23505" ? 409 : 500).json({
-      error: error.code === "23505" ? "Código de certificado já existe. Informe outro código." : INTERNAL_ERROR.error
-    });
+    return sendLaboratoryError(
+      res,
+      "PUT /tests/:id",
+      "update_test",
+      error,
+      error.code === "23505" ? 409 : 500,
+      {
+        error: error.code === "23505" ? "C\u00f3digo de certificado j\u00e1 existe. Informe outro c\u00f3digo." : INTERNAL_ERROR.error
+      }
+    );
   } finally {
     client.release();
   }
@@ -490,7 +479,6 @@ router.post("/tests/:id/cancel", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await ensureLaboratorySchema(client);
     const result = await client.query(
       `
         update laboratory_tests
@@ -504,8 +492,7 @@ router.post("/tests/:id/cancel", async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: "Ensaio não encontrado." });
     return res.json(await getTestById(client, req.params.id));
   } catch (error) {
-    console.error("Erro ao cancelar ensaio laboratorial:", error);
-    return res.status(500).json(INTERNAL_ERROR);
+    return sendLaboratoryError(res, "POST /tests/:id/cancel", "cancel_test", error);
   } finally {
     client.release();
   }
@@ -515,7 +502,6 @@ router.post("/tests/:id/reprocess", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await ensureLaboratorySchema(client);
     const current = await client.query(
       `
         select
@@ -545,8 +531,7 @@ router.post("/tests/:id/reprocess", async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: "Ensaio não encontrado." });
     return res.json(await getTestById(client, req.params.id));
   } catch (error) {
-    console.error("Erro ao reprocessar ensaio laboratorial:", error);
-    return res.status(500).json(INTERNAL_ERROR);
+    return sendLaboratoryError(res, "POST /tests/:id/reprocess", "reprocess_test", error);
   } finally {
     client.release();
   }

@@ -36,22 +36,25 @@ function normalizePayload(item = {}) {
   };
 }
 
-async function ensureParameterSchema(client) {
-  await client.query('create extension if not exists "uuid-ossp";');
-  await client.query(`
-    create table if not exists expedition_material_parameters (
-      id uuid primary key default uuid_generate_v4(),
-      material_id uuid not null references materials(id) on delete cascade,
-      can_be_shipped boolean not null default true,
-      requires_certificate boolean not null default false,
-      auto_print_certificate boolean not null default false,
-      status text not null default 'Ativo' check (status in ('Ativo', 'Inativo')),
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now(),
-      unique (material_id)
-    );
-  `);
-  await client.query("create index if not exists idx_expedition_material_parameters_material on expedition_material_parameters(material_id);");
+function isMissingSchemaError(error) {
+  return ["3F000", "42P01", "42703"].includes(error?.code);
+}
+
+function handleParameterError(error, res, action) {
+  if (isMissingSchemaError(error)) {
+    console.error(`Schema ausente ou incompatível ao ${action} parâmetros de expedição:`, {
+      code: error.code,
+      message: error.message,
+      table: error.table,
+      column: error.column
+    });
+    return res.status(503).json({
+      error: "Estrutura de banco ausente ou incompatível para parâmetros de expedição."
+    });
+  }
+
+  console.error(`Erro ao ${action} parâmetros de expedição:`, error);
+  return res.status(500).json(INTERNAL_ERROR);
 }
 
 async function listParameters(client) {
@@ -82,9 +85,10 @@ router.get("/", async (_req, res) => {
   const client = await pool.connect();
 
   try {
-    await ensureParameterSchema(client);
     return res.json(await listParameters(client));
   } catch (error) {
+    if (isMissingSchemaError(error)) return handleParameterError(error, res, "listar");
+
     console.error("Erro ao listar parâmetros de expedição:", error);
     return res.status(500).json(INTERNAL_ERROR);
   } finally {
@@ -98,7 +102,6 @@ router.put("/", async (req, res) => {
 
   try {
     await client.query("begin");
-    await ensureParameterSchema(client);
 
     for (const item of items.map(normalizePayload)) {
       if (!item.materialId) {
@@ -144,6 +147,8 @@ router.put("/", async (req, res) => {
     return res.json(parameters);
   } catch (error) {
     await client.query("rollback");
+    if (isMissingSchemaError(error)) return handleParameterError(error, res, "salvar");
+
     console.error("Erro ao salvar parâmetros de expedição:", error);
     return res.status(500).json(INTERNAL_ERROR);
   } finally {
@@ -157,7 +162,6 @@ router.put("/:materialId", async (req, res) => {
 
   try {
     await client.query("begin");
-    await ensureParameterSchema(client);
 
     if (!item.materialId) {
       await client.query("rollback");
@@ -201,6 +205,8 @@ router.put("/:materialId", async (req, res) => {
     return res.json(parameters.find((parameter) => parameter.materialId === item.materialId) || null);
   } catch (error) {
     await client.query("rollback");
+    if (isMissingSchemaError(error)) return handleParameterError(error, res, "salvar");
+
     console.error("Erro ao salvar parâmetro de expedição:", error);
     return res.status(500).json(INTERNAL_ERROR);
   } finally {

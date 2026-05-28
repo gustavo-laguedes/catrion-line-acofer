@@ -39,12 +39,6 @@ function normalizeDate(value) {
   return text;
 }
 
-async function ensurePurchaseCertificateColumns(client) {
-  await client.query("alter table stock_movements add column if not exists supplier_certificate_number text");
-  await client.query("alter table stock_movement_lots add column if not exists supplier_certificate_number text");
-  await client.query("alter table lots add column if not exists supplier_certificate_number text");
-}
-
 function toDateOnly(value) {
   if (!value) return "";
   if (value instanceof Date) return value.toISOString().slice(0, 10);
@@ -742,7 +736,6 @@ async function changePurchaseMovementStatus(req, res, nextStatus, direction) {
   const client = await pool.connect();
 
   try {
-    await ensurePurchaseCertificateColumns(client);
     await client.query("begin");
 
     const movement = await getMovementForStatusChange(client, req.params.id);
@@ -793,7 +786,6 @@ router.get("/", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await ensurePurchaseCertificateColumns(client);
     const result = await client.query(`
       select id
       from stock_movements
@@ -838,7 +830,6 @@ async function registerTransferMovement(req, res) {
       items: payload.items.length
     });
 
-    await ensurePurchaseCertificateColumns(client);
     await client.query("begin");
 
     const originLocationId = await resolveByIdOrName(
@@ -1047,7 +1038,6 @@ router.post("/", async (req, res) => {
       items: payload.items.length
     });
 
-    await ensurePurchaseCertificateColumns(client);
     await client.query("begin");
 
     const locationId = await resolveByIdOrName(client, "locations", payload.locationId, payload.locationName, "Local");

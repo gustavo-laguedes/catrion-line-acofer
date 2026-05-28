@@ -86,11 +86,14 @@ function isDuplicateCodeError(error) {
   return error && error.code === "23505";
 }
 
-function logMaterialSaveError(error) {
+function logMaterialSaveError(error, context = {}) {
   console.error("Erro ao salvar material:", error);
 
-  if (error?.message || error?.detail || error?.code || error?.constraint) {
+  if (error?.message || error?.detail || error?.code || error?.constraint || error?.materialStep || context.step) {
     console.error("Detalhes do erro ao salvar material:", {
+      route: context.route || null,
+      step: error.materialStep || context.step || null,
+      query: error.queryName || context.queryName || null,
       message: error.message,
       detail: error.detail,
       code: error.code,
@@ -108,41 +111,6 @@ function materialSaveErrorResponse(error) {
   };
 }
 
-async function getTableColumns(client, tableName) {
-  const result = await client.query(
-    `
-      select column_name
-      from information_schema.columns
-      where table_schema = current_schema()
-        and table_name = $1;
-    `,
-    [tableName]
-  );
-
-  return new Set(result.rows.map((row) => row.column_name));
-}
-
-async function getProductionModelInputColumns(client) {
-  const columns = await getTableColumns(client, "material_production_model_inputs");
-
-  if (!columns.has("consumption_mode")) {
-    await client.query(
-      "alter table material_production_model_inputs add column if not exists consumption_mode text not null default 'Fixo'"
-    );
-    columns.add("consumption_mode");
-  }
-
-  await client.query(
-    `
-      update material_production_model_inputs
-      set consumption_mode = 'Variável na produção'
-      where quantity is null
-        and coalesce(consumption_mode, 'Fixo') = 'Fixo';
-    `
-  );
-
-  return columns;
-}
 
 async function resolveOne(client, table, id, name, label) {
   if (id) {
@@ -156,6 +124,27 @@ async function resolveOne(client, table, id, name, label) {
   }
 
   throw Object.assign(new Error(`${label} não encontrado.`), { status: 400 });
+}
+
+function annotateMaterialError(error, materialStep, queryName) {
+  error.materialStep = error.materialStep || materialStep;
+  error.queryName = error.queryName || queryName;
+  return error;
+}
+
+async function resolveInputMaterialId(client, input) {
+  if (input.inputMaterialId) {
+    return resolveOne(client, "materials", input.inputMaterialId, null, "Material consumido");
+  }
+
+  const code = normalizeText(input.inputCode)?.toUpperCase();
+
+  if (code) {
+    const result = await client.query("select id from materials where code = $1 limit 1", [code]);
+    if (result.rows.length) return result.rows[0].id;
+  }
+
+  return resolveOne(client, "materials", null, input.inputMaterial, "Material consumido");
 }
 
 async function resolveMany(client, table, ids, names, label) {
@@ -233,13 +222,6 @@ async function getMaterialById(client, id, includeInactive = true) {
 }
 
 async function getProductionModels(client, materialId) {
-  const inputColumns = await getProductionModelInputColumns(client);
-  const inputMaterialExpression = inputColumns.has("material_id") && inputColumns.has("input_material_id")
-    ? "coalesce(mpi.input_material_id, mpi.material_id)"
-    : inputColumns.has("input_material_id")
-      ? "mpi.input_material_id"
-      : "mpi.material_id";
-
   const result = await client.query(
     `
       select
@@ -249,10 +231,11 @@ async function getProductionModels(client, materialId) {
         pm.output_quantity as "outputQuantity",
         pm.output_unit as "outputUnit",
         l.name as "sourceLocation",
-        'Ativo' as status
+        pm.status
       from material_production_models pm
       left join locations l on l.id = pm.source_location_id
       where pm.material_id = $1
+        and pm.status <> 'Inativo'
       order by pm.name asc;
     `,
     [materialId]
@@ -263,14 +246,15 @@ async function getProductionModels(client, materialId) {
       `
         select
           mpi.id,
+          mpi.input_material_id as "inputMaterialId",
           im.name as "inputMaterial",
           im.code as "inputCode",
           mpi.quantity as "inputQuantity",
           mpi.unit as "inputUnit",
-          coalesce(mpi.consumption_mode, 'Fixo') as "consumptionMode",
+          mpi.consumption_mode as "consumptionMode",
           mpi.notes
         from material_production_model_inputs mpi
-        join materials im on im.id = ${inputMaterialExpression}
+        join materials im on im.id = mpi.input_material_id
         where mpi.production_model_id = $1
         order by im.name asc;
       `,
@@ -398,20 +382,28 @@ router.post("/", async (req, res) => {
 
 router.put("/:id", async (req, res) => {
   const client = await pool.connect();
+  let materialStep = "put.start";
 
   try {
+    materialStep = "put.normalizePayload";
     const { id } = req.params;
     const payload = normalizePayload(req.body || {});
 
     if (!id) return res.status(400).json({ error: "ID é obrigatório." });
     if (!validatePayload(payload, res)) return null;
 
+    materialStep = "put.begin";
     await client.query("begin");
+    materialStep = "put.resolveMaterialType";
     const materialTypeId = await resolveOne(client, "material_types", payload.materialTypeId, payload.type, "Tipo de material");
+    materialStep = "put.resolveAllowedLocations";
     const allowedLocationIds = await resolveMany(client, "locations", payload.allowedLocationIds, payload.allowedLocations, "Local");
+    materialStep = "put.resolveProductionMachines";
     const machineIds = await resolveMany(client, "machines", payload.productionMachineIds, payload.productionMachines, "Máquina");
+    materialStep = "put.resolveRecommendedOperators";
     const operatorIds = await resolveMany(client, "operators", payload.recommendedOperatorIds, [], "Operador");
 
+    materialStep = "put.updateMaterial";
     const result = await client.query(
       `
         update materials
@@ -462,15 +454,23 @@ router.put("/:id", async (req, res) => {
       return res.status(404).json({ error: "Material não encontrado." });
     }
 
+    materialStep = "put.replaceMaterialRelations";
     await replaceMaterialRelations(client, id, allowedLocationIds, machineIds, operatorIds);
+    materialStep = "put.replaceProductionModels";
     await replaceProductionModels(client, id, payload.productionModels);
 
+    materialStep = "put.getMaterialById";
     const material = await getMaterialById(client, id);
+    materialStep = "put.commit";
     await client.query("commit");
 
     return res.json(material);
   } catch (error) {
     await client.query("rollback");
+    logMaterialSaveError(error, {
+      route: "PUT /api/materials/:id",
+      step: error.materialStep || materialStep
+    });
 
     if (error.status) {
       return res.status(error.status).json({ error: error.message });
@@ -522,108 +522,167 @@ router.delete("/:id", async (req, res) => {
 });
 
 async function replaceMaterialRelations(client, materialId, locationIds, machineIds, operatorIds) {
-  await client.query("delete from material_allowed_locations where material_id = $1", [materialId]);
-  await client.query("delete from material_production_machines where material_id = $1", [materialId]);
-  await client.query("delete from material_recommended_operators where material_id = $1", [materialId]);
+  try {
+    await client.query("delete from material_allowed_locations where material_id = $1", [materialId]);
+    await client.query("delete from material_production_machines where material_id = $1", [materialId]);
+    await client.query("delete from material_recommended_operators where material_id = $1", [materialId]);
 
-  for (const locationId of locationIds) {
-    await client.query(
-      "insert into material_allowed_locations (material_id, location_id) values ($1, $2)",
-      [materialId, locationId]
-    );
-  }
+    for (const locationId of locationIds) {
+      await client.query(
+        "insert into material_allowed_locations (material_id, location_id) values ($1, $2)",
+        [materialId, locationId]
+      );
+    }
 
-  for (const machineId of machineIds) {
-    await client.query(
-      "insert into material_production_machines (material_id, machine_id) values ($1, $2)",
-      [materialId, machineId]
-    );
-  }
+    for (const machineId of machineIds) {
+      await client.query(
+        "insert into material_production_machines (material_id, machine_id) values ($1, $2)",
+        [materialId, machineId]
+      );
+    }
 
-  for (const operatorId of operatorIds) {
-    await client.query(
-      "insert into material_recommended_operators (material_id, operator_id) values ($1, $2)",
-      [materialId, operatorId]
-    );
+    for (const operatorId of operatorIds) {
+      await client.query(
+        "insert into material_recommended_operators (material_id, operator_id) values ($1, $2)",
+        [materialId, operatorId]
+      );
+    }
+  } catch (error) {
+    throw annotateMaterialError(error, "replaceMaterialRelations", "replace material relations");
   }
 }
 
 async function replaceProductionModels(client, materialId, models) {
-  const inputColumns = await getProductionModelInputColumns(client);
-  await client.query("delete from material_production_models where material_id = $1", [materialId]);
+  const existingModels = await client.query(
+    "select id from material_production_models where material_id = $1",
+    [materialId]
+  );
+  const existingModelIds = new Set(existingModels.rows.map((row) => String(row.id)));
+  const keptModelIds = new Set();
 
   for (const model of models) {
     const sourceLocationId = model.sourceLocation && model.sourceLocation !== "Selecione um local"
       ? await resolveOne(client, "locations", model.sourceLocationId || null, model.sourceLocation, "Local de origem")
       : null;
 
-    const modelResult = await client.query(
-      `
-        insert into material_production_models (
-          material_id,
-          name,
-          output_quantity,
-          output_unit,
-          source_location_id,
-          status
+    const modelId = model.id && existingModelIds.has(String(model.id)) ? model.id : null;
+    const modelResult = modelId
+      ? await client.query(
+          `
+            update material_production_models
+            set
+              name = $1,
+              output_quantity = $2,
+              output_unit = $3,
+              source_location_id = $4,
+              status = $5,
+              updated_at = now()
+            where id = $6
+              and material_id = $7
+            returning id;
+          `,
+          [
+            normalizeText(model.name),
+            normalizeDecimal(model.outputQuantity),
+            normalizeText(model.outputUnit),
+            sourceLocationId,
+            normalizeText(model.status) || "Ativo",
+            modelId,
+            materialId
+          ]
         )
-        values ($1, $2, $3, $4, $5, $6)
-        returning id;
-      `,
-      [
-        materialId,
-        normalizeText(model.name),
-        normalizeDecimal(model.outputQuantity),
-        normalizeText(model.outputUnit),
-        sourceLocationId,
-        normalizeText(model.status) || "Ativo"
-      ]
-    );
+      : await client.query(
+          `
+            insert into material_production_models (
+              material_id,
+              name,
+              output_quantity,
+              output_unit,
+              source_location_id,
+              status
+            )
+            values ($1, $2, $3, $4, $5, $6)
+            returning id;
+          `,
+          [
+            materialId,
+            normalizeText(model.name),
+            normalizeDecimal(model.outputQuantity),
+            normalizeText(model.outputUnit),
+            sourceLocationId,
+            normalizeText(model.status) || "Ativo"
+          ]
+        );
 
     const productionModelId = modelResult.rows[0].id;
+    keptModelIds.add(String(productionModelId));
     const inputs = Array.isArray(model.inputs) ? model.inputs : [];
 
+    await client.query("delete from material_production_model_inputs where production_model_id = $1", [productionModelId]);
+
     for (const input of inputs) {
-      const inputMaterialId = await resolveOne(
-        client,
-        "materials",
-        input.inputMaterialId || null,
-        input.inputMaterial,
-        "Material consumido"
-      );
+      const inputMaterialId = await resolveInputMaterialId(client, input);
 
-      const insertColumns = ["production_model_id"];
-      const values = [productionModelId];
-
-      if (inputColumns.has("material_id")) {
-        insertColumns.push("material_id");
-        values.push(inputMaterialId);
+      try {
+        await client.query(
+          `
+            insert into material_production_model_inputs (
+              production_model_id,
+              material_id,
+              input_material_id,
+              quantity,
+              unit,
+              consumption_mode,
+              notes
+            )
+            values ($1, $2, $3, $4, $5, $6, $7);
+          `,
+          [
+            productionModelId,
+            inputMaterialId,
+            inputMaterialId,
+            normalizeDecimal(input.quantity ?? input.inputQuantity),
+            normalizeText(input.unit || input.inputUnit),
+            normalizeText(input.consumptionMode) || "Fixo",
+            normalizeText(input.notes)
+          ]
+        );
+      } catch (error) {
+        throw annotateMaterialError(
+          error,
+          "replaceProductionModels.insertInput",
+          "insert material_production_model_inputs"
+        );
       }
-
-      if (inputColumns.has("input_material_id")) {
-        insertColumns.push("input_material_id");
-        values.push(inputMaterialId);
-      }
-
-      insertColumns.push("quantity", "unit", "consumption_mode", "notes");
-      values.push(
-        normalizeDecimal(input.quantity ?? input.inputQuantity),
-        normalizeText(input.unit || input.inputUnit),
-        normalizeText(input.consumptionMode) || "Fixo",
-        normalizeText(input.notes)
-      );
-
-      const placeholders = values.map((_, index) => `$${index + 1}`).join(", ");
-
-      await client.query(
-        `
-          insert into material_production_model_inputs (${insertColumns.join(", ")})
-          values (${placeholders});
-        `,
-        values
-      );
     }
+  }
+
+  const removedModelIds = [...existingModelIds].filter((id) => !keptModelIds.has(id));
+
+  for (const modelId of removedModelIds) {
+    await client.query(
+      `
+        delete from material_production_models pm
+        where pm.id = $1
+          and not exists (
+            select 1
+            from productions p
+            where p.production_model_id = pm.id
+          );
+      `,
+      [modelId]
+    );
+
+    await client.query(
+      `
+        update material_production_models
+        set status = 'Inativo', updated_at = now()
+        where id = $1;
+      `,
+      [modelId]
+    );
   }
 }
 
 module.exports = router;
+

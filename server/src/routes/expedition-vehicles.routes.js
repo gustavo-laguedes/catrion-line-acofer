@@ -30,22 +30,6 @@ function normalizeVehicle(row) {
   };
 }
 
-async function ensureVehicleSchema(client) {
-  await client.query('create extension if not exists "uuid-ossp";');
-  await client.query(`
-    create table if not exists expedition_vehicles (
-      id uuid primary key default uuid_generate_v4(),
-      name text not null,
-      plate text not null,
-      type text not null,
-      status text not null default 'Ativo' check (status in ('Ativo', 'Inativo')),
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    );
-  `);
-  await client.query("create unique index if not exists idx_expedition_vehicles_plate on expedition_vehicles (upper(plate));");
-}
-
 function validatePayload(payload, res) {
   if (!payload.name) {
     res.status(400).json({ error: "Nome é obrigatório." });
@@ -74,11 +58,31 @@ function isDuplicatePlateError(error) {
   return error?.code === "23505" && String(error?.constraint || "").includes("expedition_vehicles_plate");
 }
 
+function isMissingSchemaError(error) {
+  return ["3F000", "42P01", "42703"].includes(error?.code);
+}
+
+function handleVehicleError(error, res, action) {
+  if (isMissingSchemaError(error)) {
+    console.error(`Schema ausente ou incompatível ao ${action} veículos de expedição:`, {
+      code: error.code,
+      message: error.message,
+      table: error.table,
+      column: error.column
+    });
+    return res.status(503).json({
+      error: "Estrutura de banco ausente ou incompatível para veículos de expedição."
+    });
+  }
+
+  console.error(`Erro ao ${action} veículos de expedição:`, error);
+  return res.status(500).json(INTERNAL_ERROR);
+}
+
 router.get("/", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await ensureVehicleSchema(client);
     const includeInactive = req.query.includeInactive === "true";
     const result = await client.query(`
       select
@@ -96,6 +100,8 @@ router.get("/", async (req, res) => {
 
     return res.json(result.rows.map(normalizeVehicle));
   } catch (error) {
+    if (isMissingSchemaError(error)) return handleVehicleError(error, res, "listar");
+
     console.error("Erro ao listar veículos de expedição:", error);
     return res.status(500).json(INTERNAL_ERROR);
   } finally {
@@ -107,7 +113,6 @@ router.post("/", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await ensureVehicleSchema(client);
     const payload = normalizePayload(req.body);
     if (!validatePayload(payload, res)) return null;
 
@@ -126,6 +131,8 @@ router.post("/", async (req, res) => {
       return res.status(409).json({ error: "Já existe um veículo com esta placa." });
     }
 
+    if (isMissingSchemaError(error)) return handleVehicleError(error, res, "criar");
+
     console.error("Erro ao criar veículo de expedição:", error);
     return res.status(500).json(INTERNAL_ERROR);
   } finally {
@@ -137,7 +144,6 @@ router.put("/:id", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await ensureVehicleSchema(client);
     const payload = normalizePayload(req.body);
     if (!validatePayload(payload, res)) return null;
 
@@ -166,6 +172,8 @@ router.put("/:id", async (req, res) => {
       return res.status(409).json({ error: "Já existe outro veículo com esta placa." });
     }
 
+    if (isMissingSchemaError(error)) return handleVehicleError(error, res, "atualizar");
+
     console.error("Erro ao atualizar veículo de expedição:", error);
     return res.status(500).json(INTERNAL_ERROR);
   } finally {
@@ -177,7 +185,6 @@ router.delete("/:id", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await ensureVehicleSchema(client);
     const result = await client.query(
       `
         update expedition_vehicles
@@ -194,6 +201,8 @@ router.delete("/:id", async (req, res) => {
 
     return res.json(normalizeVehicle(result.rows[0]));
   } catch (error) {
+    if (isMissingSchemaError(error)) return handleVehicleError(error, res, "inativar");
+
     console.error("Erro ao inativar veículo de expedição:", error);
     return res.status(500).json(INTERNAL_ERROR);
   } finally {
