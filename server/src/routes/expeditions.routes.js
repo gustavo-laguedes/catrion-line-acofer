@@ -3,6 +3,9 @@ const { pool } = require("../db");
 
 const router = express.Router();
 const INTERNAL_ERROR = { error: "Erro interno ao processar expedições." };
+const DATA_STRUCTURE_ERROR = {
+  error: "Estrutura de dados indisponivel ou incompativel. Contate o administrador do sistema."
+};
 
 function normalizeText(value) {
   const text = String(value || "").trim();
@@ -47,20 +50,24 @@ function isMissingSchemaError(error) {
   return ["3F000", "42P01", "42703"].includes(error?.code);
 }
 
+function logExpeditionError(route, step, error) {
+  console.error("Erro ao processar expedicoes:", {
+    route,
+    step,
+    code: error?.code,
+    message: error?.message,
+    detail: error?.detail,
+    constraint: error?.constraint
+  });
+}
+
 function handleExpeditionError(error, res, action, fallbackMessage = INTERNAL_ERROR.error) {
   if (isMissingSchemaError(error)) {
-    console.error(`Schema ausente ou incompatível ao ${action} expedições:`, {
-      code: error.code,
-      message: error.message,
-      table: error.table,
-      column: error.column
-    });
-    return res.status(503).json({
-      error: "Estrutura de banco ausente ou incompatível para expedições."
-    });
+    logExpeditionError("/api/expeditions", action, error);
+    return res.status(503).json(DATA_STRUCTURE_ERROR);
   }
 
-  console.error(`Erro ao ${action} expedições:`, error);
+  logExpeditionError("/api/expeditions", action, error);
   return res.status(500).json({ error: fallbackMessage });
 }
 

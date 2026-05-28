@@ -3,6 +3,9 @@ const { pool } = require("../db");
 
 const router = express.Router();
 const INTERNAL_ERROR = { error: "Erro interno ao processar parâmetros de expedição." };
+const DATA_STRUCTURE_ERROR = {
+  error: "Estrutura de dados indisponivel ou incompativel. Contate o administrador do sistema."
+};
 
 function normalizeBoolean(value, fallback = false) {
   if (value === undefined || value === null) return fallback;
@@ -40,20 +43,24 @@ function isMissingSchemaError(error) {
   return ["3F000", "42P01", "42703"].includes(error?.code);
 }
 
+function logParameterError(route, step, error) {
+  console.error("Erro ao processar parametros de expedicao:", {
+    route,
+    step,
+    code: error?.code,
+    message: error?.message,
+    detail: error?.detail,
+    constraint: error?.constraint
+  });
+}
+
 function handleParameterError(error, res, action) {
   if (isMissingSchemaError(error)) {
-    console.error(`Schema ausente ou incompatível ao ${action} parâmetros de expedição:`, {
-      code: error.code,
-      message: error.message,
-      table: error.table,
-      column: error.column
-    });
-    return res.status(503).json({
-      error: "Estrutura de banco ausente ou incompatível para parâmetros de expedição."
-    });
+    logParameterError("/api/expedition-material-parameters", action, error);
+    return res.status(503).json(DATA_STRUCTURE_ERROR);
   }
 
-  console.error(`Erro ao ${action} parâmetros de expedição:`, error);
+  logParameterError("/api/expedition-material-parameters", action, error);
   return res.status(500).json(INTERNAL_ERROR);
 }
 

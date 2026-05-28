@@ -3,7 +3,7 @@ const { pool, query } = require("../db");
 
 const router = express.Router();
 const SCHEMA_ERROR = {
-  error: "Schema do laboratorio ausente ou incompativel. Execute as migrations/baseline antes de usar este endpoint."
+  error: "Estrutura de dados indisponivel ou incompativel. Contate o administrador do sistema."
 };
 const SCHEMA_ERROR_CODES = new Set(["42P01", "42703", "42883", "42P07"]);
 const INTERNAL_ERROR = { error: "Erro interno ao processar laboratório." };
