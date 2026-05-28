@@ -30,6 +30,16 @@ let modelDraftForm = {
 };
 
 let modelDraftInputs = [];
+let modelDraftEditingInputIndex = null;
+
+let modelDraftInputForm = {
+  inputMaterial: "Selecione um material",
+  inputCode: "",
+  consumptionMode: "Fixo",
+  inputQuantity: "",
+  inputUnit: "un",
+  notes: ""
+};
 
 export const materiaisPage = {
   title: "🧱 Materiais",
@@ -132,18 +142,18 @@ function renderMaterialRow(material) {
 
   return `
     <tr class="clickable-row" data-material-index="${materials.indexOf(material)}">
-      <td><strong>${material.code}</strong></td>
-      <td>${material.name}</td>
-      <td>${material.type}</td>
-      <td>${material.lotCode || "-"}</td>
-      <td>${material.unit}</td>
-      <td>${material.secondaryUnit || "-"}</td>
+      <td><strong>${displayValue(material.code)}</strong></td>
+      <td>${displayValue(material.name)}</td>
+      <td>${displayValue(material.type)}</td>
+      <td>${displayValue(material.lotCode)}</td>
+      <td>${displayValue(material.unit)}</td>
+      <td>${displayValue(material.secondaryUnit)}</td>
       <td>${renderSecondaryUnitRuleSummary(material)}</td>
       <td>${renderMaterialLocationsSummary(material)}</td>
       <td>${material.canBePurchased ? "Sim" : "Não"}</td>
       <td>${material.canBeProduced ? "Sim" : "Não"}</td>
-      <td>${material.controlsMinStock ? material.minStock : "-"}</td>
-      <td><span class="badge ${statusClass}">${material.status}</span></td>
+      <td>${material.controlsMinStock ? displayValue(material.minStock) : "-"}</td>
+      <td><span class="badge ${statusClass}">${displayValue(material.status)}</span></td>
     </tr>
   `;
 }
@@ -158,6 +168,10 @@ function renderMaterialLocationsSummary(material) {
   const locations = getMaterialAllowedLocations(material);
 
   return locations.length ? locations.join(" / ") : "-";
+}
+
+function displayValue(value) {
+  return value === undefined || value === null || value === "" ? "-" : value;
 }
 
 function renderSecondaryUnitRuleSummary(material) {
@@ -272,7 +286,7 @@ function renderMaterialModal() {
           </div>
         </div>
 
-        <div class="machine-picker">
+        <div class="machine-picker hidden" id="materialProductionMachinePicker">
   <div class="machine-picker-header">
     <strong>Máquinas usadas na produção</strong>
     <span>Selecione uma ou mais máquinas</span>
@@ -284,8 +298,8 @@ function renderMaterialModal() {
 </div>
 
         <div class="checkbox-grid material-checkbox-grid">
-          <label><input id="materialPurchasedInput" type="checkbox" /> Pode ser comprado</label>
-          <label><input id="materialProducedInput" type="checkbox" /> Pode ser produzido</label>
+          <label><input id="materialPurchasedInput" type="checkbox" /> Provém de compra</label>
+          <label><input id="materialProducedInput" type="checkbox" /> Provém de produção</label>
           <label><input id="materialControlsMinStockInput" type="checkbox" /> Controla estoque mínimo</label>
         </div>
 
@@ -313,6 +327,9 @@ function renderMaterialModal() {
 
 function renderEditMaterialModal(material) {
   const disabled = isEditingMaterial ? "" : "disabled";
+  if (!material.canBeProduced && activeMaterialTab === "modelos") {
+    activeMaterialTab = "geral";
+  }
 
   return `
     <div class="modal-backdrop open" id="editMaterialModal">
@@ -331,7 +348,7 @@ function renderEditMaterialModal(material) {
             Geral
           </button>
 
-          <button class="material-tab ${activeMaterialTab === "modelos" ? "active" : ""}" data-material-tab="modelos">
+          <button class="material-tab ${activeMaterialTab === "modelos" ? "active" : ""} ${material.canBeProduced ? "" : "hidden"}" data-material-tab="modelos" ${material.canBeProduced ? "" : "disabled"}>
   Modelos de produção
 </button>
         </div>
@@ -468,26 +485,26 @@ function renderMaterialGeneralTab(material, disabled) {
       </div>
     </div>
 
-    <div class="machine-picker ${readonlyClass}">
+    <div class="machine-picker ${readonlyClass} ${material.canBeProduced ? "" : "hidden"}" id="editMaterialProductionMachinePicker">
   <div class="machine-picker-header">
     <strong>Máquinas usadas na produção</strong>
     <span>Selecione uma ou mais máquinas</span>
   </div>
 
   <div class="machine-options">
-    ${renderMachineCheckboxes(material.productionMachines || [], "edit")}
+    ${renderMachineCheckboxes(material.productionMachines || [], "edit", disabled)}
   </div>
 </div>
 
     <div class="checkbox-grid material-checkbox-grid ${readonlyClass}">
       <label>
         <input id="editMaterialPurchasedInput" type="checkbox" ${material.canBePurchased ? "checked" : ""} ${disabled} />
-        Pode ser comprado
+        Provém de compra
       </label>
 
       <label>
         <input id="editMaterialProducedInput" type="checkbox" ${material.canBeProduced ? "checked" : ""} ${disabled} />
-        Pode ser produzido
+        Provém de produção
       </label>
 
       <label>
@@ -672,32 +689,39 @@ function renderProductionModelModal() {
             <label>
               Material consumido
               <select id="modelInputMaterialInput">
-                ${renderConsumedMaterialOptions()}
+                ${renderConsumedMaterialOptions(modelDraftInputForm.inputMaterial)}
               </select>
             </label>
 
             <label>
               Código do material
-              <input id="modelInputCodeInput" type="text" value="" placeholder="Selecionar material" disabled />
+              <input id="modelInputCodeInput" type="text" value="${modelDraftInputForm.inputCode}" placeholder="Selecionar material" disabled />
             </label>
 
             <label>
               Tipo de consumo
               <select id="modelConsumptionModeInput">
-                <option>Fixo</option>
-                <option>Variável na produção</option>
+                <option ${modelDraftInputForm.consumptionMode === "Fixo" ? "selected" : ""}>Fixo</option>
+                <option ${modelDraftInputForm.consumptionMode === "Variável na produção" ? "selected" : ""}>Variável na produção</option>
               </select>
             </label>
 
             <label>
               Quantidade consumida
-              <input id="modelInputQuantityInput" type="text" inputmode="decimal" placeholder="0,000" />
+              <input
+                id="modelInputQuantityInput"
+                type="text"
+                inputmode="decimal"
+                value="${modelDraftInputForm.inputQuantity}"
+                placeholder="${modelDraftInputForm.consumptionMode === "Variável na produção" ? "Informado na produção" : "0,000"}"
+                ${modelDraftInputForm.consumptionMode === "Variável na produção" ? "disabled" : ""}
+              />
             </label>
 
             <label>
               Unidade consumida
               <select id="modelInputUnitInput">
-                ${renderSelectOptions(unitOptions)}
+                ${renderSelectOptions(unitOptions, modelDraftInputForm.inputUnit)}
               </select>
             </label>
           </div>
@@ -705,12 +729,14 @@ function renderProductionModelModal() {
           <div class="form-grid single">
             <label>
               Observação
-              <input id="modelInputNotesInput" type="text" placeholder="Observação opcional sobre este consumo" />
+              <input id="modelInputNotesInput" type="text" value="${modelDraftInputForm.notes}" placeholder="Observação opcional sobre este consumo" />
             </label>
           </div>
 
           <div class="structure-actions">
-            <button class="secondary-btn" id="addModelInputBtn">+ Adicionar item consumido</button>
+            <button class="secondary-btn" id="addModelInputBtn">
+              ${modelDraftEditingInputIndex !== null ? "Salvar item consumido" : "+ Adicionar item consumido"}
+            </button>
           </div>
         </div>
 
@@ -738,14 +764,17 @@ function renderModelDraftInputs() {
             </span>
           </div>
 
-          <button class="mini-danger-btn" data-remove-draft-input-index="${index}">Remover</button>
+          <div class="model-card-actions">
+            <button class="secondary-btn small-action-btn" data-edit-draft-input-index="${index}">Editar</button>
+            <button class="mini-danger-btn" data-remove-draft-input-index="${index}">Remover</button>
+          </div>
         </div>
       `).join("")}
     </div>
   `;
 }
 
-function renderConsumedMaterialOptions() {
+function renderConsumedMaterialOptions(selectedValue = "") {
   const availableMaterials = getConsumedMaterialOptions(selectedMaterialIndex);
 
   if (!availableMaterials.length) {
@@ -753,8 +782,8 @@ function renderConsumedMaterialOptions() {
   }
 
   return [
-    `<option>Selecione um material</option>`,
-    ...availableMaterials.map(material => `<option value="${material.name}">${material.name}</option>`)
+    `<option ${selectedValue === "Selecione um material" ? "selected" : ""}>Selecione um material</option>`,
+    ...availableMaterials.map(material => `<option value="${material.name}" ${material.name === selectedValue ? "selected" : ""}>${material.name}</option>`)
   ].join("");
 }
 
@@ -797,6 +826,7 @@ function renderDeleteModelWarningModal(model) {
 
 function resetProductionModelDraft() {
   selectedProductionModelIndex = null;
+  resetModelDraftInputForm();
 
   modelDraftForm = {
     name: "",
@@ -808,6 +838,18 @@ function resetProductionModelDraft() {
   modelDraftInputs = [];
 }
 
+function resetModelDraftInputForm() {
+  modelDraftEditingInputIndex = null;
+  modelDraftInputForm = {
+    inputMaterial: "Selecione um material",
+    inputCode: "",
+    consumptionMode: "Fixo",
+    inputQuantity: "",
+    inputUnit: "un",
+    notes: ""
+  };
+}
+
 function captureProductionModelDraft() {
   modelDraftForm = {
     name: document.getElementById("modelNameInput")?.value.trim() || "",
@@ -817,7 +859,28 @@ function captureProductionModelDraft() {
   };
 }
 
+function captureModelDraftInputForm() {
+  const inputMaterial = document.getElementById("modelInputMaterialInput")?.value || "Selecione um material";
+  const selectedInputMaterial = getMaterialByName(inputMaterial);
+  const consumptionMode = document.getElementById("modelConsumptionModeInput")?.value || "Fixo";
+
+  modelDraftInputForm = {
+    inputMaterial,
+    inputCode: selectedInputMaterial?.code || document.getElementById("modelInputCodeInput")?.value || "",
+    consumptionMode,
+    inputQuantity: consumptionMode === "Fixo" ? document.getElementById("modelInputQuantityInput")?.value.trim() || "" : "",
+    inputUnit: document.getElementById("modelInputUnitInput")?.value || "un",
+    notes: document.getElementById("modelInputNotesInput")?.value.trim() || ""
+  };
+}
+
 function openProductionModelModalForCreate() {
+  const material = materials[selectedMaterialIndex];
+  if (material && !material.canBeProduced) {
+    alert("Modelos de produção ficam disponíveis apenas para materiais que provêm de produção.");
+    return;
+  }
+
   resetProductionModelDraft();
   isProductionModelModalOpen = true;
   activeMaterialTab = "modelos";
@@ -826,6 +889,11 @@ function openProductionModelModalForCreate() {
 
 function openProductionModelModalForEdit(index) {
   const material = materials[selectedMaterialIndex];
+  if (!material?.canBeProduced) {
+    alert("Modelos de produção ficam disponíveis apenas para materiais que provêm de produção.");
+    return;
+  }
+
   const model = material.productionModels[index];
 
   selectedProductionModelIndex = index;
@@ -838,13 +906,14 @@ function openProductionModelModalForEdit(index) {
   };
 
   modelDraftInputs = [...model.inputs];
+  resetModelDraftInputForm();
 
   isProductionModelModalOpen = true;
   activeMaterialTab = "modelos";
   rerenderMateriais();
 }
 
-function renderMachineCheckboxes(selectedMachines = [], prefix = "new") {
+function renderMachineCheckboxes(selectedMachines = [], prefix = "new", disabled = "") {
   return getMachineOptions().map((machine, index) => `
     <label>
       <input
@@ -853,6 +922,7 @@ function renderMachineCheckboxes(selectedMachines = [], prefix = "new") {
         data-machine-name="${machine}"
         ${prefix === "edit" ? `id="editMaterialMachine${index}"` : `id="materialMachine${index}"`}
         ${selectedMachines.includes(machine) ? "checked" : ""}
+        ${disabled}
       />
       ${machine}
     </label>
@@ -892,6 +962,21 @@ function getSelectedMaterialLocations() {
 function getSelectedMachines() {
   return Array.from(document.querySelectorAll(".material-machine-checkbox:checked"))
     .map(input => input.dataset.machineName);
+}
+
+function syncMaterialOriginUi(prefix = "new") {
+  const producedInput = document.getElementById(prefix === "edit" ? "editMaterialProducedInput" : "materialProducedInput");
+  const machinePicker = document.getElementById(prefix === "edit" ? "editMaterialProductionMachinePicker" : "materialProductionMachinePicker");
+  const isProduced = Boolean(producedInput?.checked);
+
+  machinePicker?.classList.toggle("hidden", !isProduced);
+  machinePicker?.querySelectorAll("input").forEach((input) => {
+    input.disabled = !isProduced || (prefix === "edit" && !isEditingMaterial);
+  });
+}
+
+function hasMaterialOrigin(canBePurchased, canBeProduced) {
+  return canBePurchased || canBeProduced;
 }
 
 function renderDeleteWarningModal(material) {
@@ -962,6 +1047,7 @@ const addModelInputBtn = document.getElementById("addModelInputBtn");
 const saveProductionModelBtn = document.getElementById("saveProductionModelBtn");
 const openDeleteModelButtons = document.querySelectorAll("[data-open-delete-model-index]");
 const removeDraftInputButtons = document.querySelectorAll("[data-remove-draft-input-index]");
+const editDraftInputButtons = document.querySelectorAll("[data-edit-draft-input-index]");
 const editModelButtons = document.querySelectorAll("[data-edit-model-index]");
 const modelInputMaterialInput = document.getElementById("modelInputMaterialInput");
 const modelInputCodeInput = document.getElementById("modelInputCodeInput");
@@ -973,6 +1059,8 @@ const modelInputCodeInput = document.getElementById("modelInputCodeInput");
   const minStockField = document.getElementById("minStockField");
   const secondaryUnitModeInput = document.getElementById("materialSecondaryUnitModeInput");
   const fixedConversionFields = document.getElementById("materialFixedConversionFields");
+  const materialProducedInput = document.getElementById("materialProducedInput");
+  const editMaterialProducedInput = document.getElementById("editMaterialProducedInput");
 
   const materialMinStockInput = document.getElementById("materialMinStockInput");
   const editMaterialMinStockInput = document.getElementById("editMaterialMinStockInput");
@@ -989,6 +1077,22 @@ const modelInputCodeInput = document.getElementById("modelInputCodeInput");
     fixedConversionFields.classList.toggle("hidden", secondaryUnitModeInput.value !== "fixed");
   });
 
+  syncMaterialOriginUi();
+  syncMaterialOriginUi("edit");
+
+  materialProducedInput?.addEventListener("change", () => {
+    syncMaterialOriginUi();
+  });
+
+  editMaterialProducedInput?.addEventListener("change", () => {
+    const material = materials[selectedMaterialIndex];
+    if (!editMaterialProducedInput.checked && material?.productionModels?.length) {
+      alert("Modelos de produção existentes serão preservados, mas ficarão bloqueados enquanto o material não provier de produção.");
+    }
+
+    syncMaterialOriginUi("edit");
+  });
+
   applyDecimalMask(materialMinStockInput);
   applyDecimalMask(editMaterialMinStockInput);
   applyDecimalMask(materialFixedPrimaryQuantityInput);
@@ -1001,6 +1105,11 @@ const modelInputCodeInput = document.getElementById("modelInputCodeInput");
 
 materialTabs.forEach((tab) => {
   tab.addEventListener("click", () => {
+    if (tab.dataset.materialTab === "modelos" && !materials[selectedMaterialIndex]?.canBeProduced) {
+      alert("Modelos de produção ficam disponíveis apenas para materiais que provêm de produção.");
+      return;
+    }
+
     activeMaterialTab = tab.dataset.materialTab;
     rerenderMateriais();
   });
@@ -1015,6 +1124,7 @@ cancelProductionModelModalBtn?.addEventListener("click", closeProductionModelMod
 modelInputMaterialInput?.addEventListener("change", () => {
   const selectedMaterial = getMaterialByName(modelInputMaterialInput.value);
   modelInputCodeInput.value = selectedMaterial?.code || "";
+  captureModelDraftInputForm();
 });
 
   openBtn?.addEventListener("click", () => {
@@ -1050,7 +1160,7 @@ modelInputMaterialInput?.addEventListener("change", () => {
     const minStock = document.getElementById("materialMinStockInput").value;
 
     const recommendedOperators = document.getElementById("materialOperatorsInput").value;
-const productionMachines = getSelectedMachines();
+const productionMachines = canBeProduced ? getSelectedMachines() : [];
 
     if (!name || !code) {
       alert("Preencha pelo menos o nome e o código do material.");
@@ -1071,6 +1181,11 @@ const productionMachines = getSelectedMachines();
   alert("Selecione pelo menos um local permitido para estoque.");
   return;
 }
+
+    if (!hasMaterialOrigin(canBePurchased, canBeProduced)) {
+      alert("Selecione pelo menos uma origem: compra ou produção.");
+      return;
+    }
 
     if (controlsMinStock && !minStock) {
       alert("Informe o estoque mínimo.");
@@ -1181,6 +1296,11 @@ rerenderMateriais();
     const canBePurchased = document.getElementById("editMaterialPurchasedInput").checked;
     const canBeProduced = document.getElementById("editMaterialProducedInput").checked;
 
+    if (!hasMaterialOrigin(canBePurchased, canBeProduced)) {
+      alert("Selecione pelo menos uma origem: compra ou produção.");
+      return;
+    }
+
     const updatedMaterial = await updateMaterial(material, {
       ...material,
       name,
@@ -1203,7 +1323,7 @@ rerenderMateriais();
       controlsMinimumStock: controlsMinStock,
       minStock,
       minimumStockQuantity: minStock,
-      productionMachines: getSelectedMachines(),
+      productionMachines: canBeProduced ? getSelectedMachines() : (material.productionMachines || []),
       recommendedOperators: document.getElementById("editMaterialOperatorsInput").value
     });
 
@@ -1249,6 +1369,7 @@ rerenderMateriais();
 
   modelConsumptionModeInput?.addEventListener("change", () => {
   const quantityInput = document.getElementById("modelInputQuantityInput");
+  captureModelDraftInputForm();
 
   if (modelConsumptionModeInput.value === "Variável na produção") {
     quantityInput.value = "";
@@ -1262,13 +1383,8 @@ rerenderMateriais();
 
 addModelInputBtn?.addEventListener("click", () => {
   captureProductionModelDraft();
-  const inputMaterial = document.getElementById("modelInputMaterialInput").value;
-  const selectedInputMaterial = getMaterialByName(inputMaterial);
-  const inputCode = selectedInputMaterial?.code || "";
-  const consumptionMode = document.getElementById("modelConsumptionModeInput").value;
-  const inputQuantity = document.getElementById("modelInputQuantityInput").value.trim();
-  const inputUnit = document.getElementById("modelInputUnitInput").value;
-  const notes = document.getElementById("modelInputNotesInput").value.trim();
+  captureModelDraftInputForm();
+  const { inputMaterial, inputCode, consumptionMode, inputQuantity, inputUnit, notes } = modelDraftInputForm;
 
   if (!inputMaterial || inputMaterial === "Selecione um material" || inputMaterial === "Nenhum material disponível") {
     alert("Selecione o material consumido.");
@@ -1280,14 +1396,22 @@ addModelInputBtn?.addEventListener("click", () => {
     return;
   }
 
-  modelDraftInputs.push({
-  inputMaterial,
-  inputCode,
-  consumptionMode,
-  inputQuantity: consumptionMode === "Fixo" ? inputQuantity : "",
-  inputUnit,
-  notes
-});
+  const nextInput = {
+    inputMaterial,
+    inputCode,
+    consumptionMode,
+    inputQuantity: consumptionMode === "Fixo" ? inputQuantity : "",
+    inputUnit,
+    notes
+  };
+
+  if (modelDraftEditingInputIndex !== null) {
+    modelDraftInputs[modelDraftEditingInputIndex] = nextInput;
+  } else {
+    modelDraftInputs.push(nextInput);
+  }
+
+  resetModelDraftInputForm();
 
   activeMaterialTab = "modelos";
   rerenderMateriais();
@@ -1297,6 +1421,34 @@ removeDraftInputButtons.forEach((button) => {
   button.addEventListener("click", () => {
     const index = Number(button.dataset.removeDraftInputIndex);
     modelDraftInputs.splice(index, 1);
+    if (modelDraftEditingInputIndex === index) {
+      resetModelDraftInputForm();
+    } else if (modelDraftEditingInputIndex !== null && modelDraftEditingInputIndex > index) {
+      modelDraftEditingInputIndex -= 1;
+    }
+
+    activeMaterialTab = "modelos";
+    rerenderMateriais();
+  });
+});
+
+editDraftInputButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    captureProductionModelDraft();
+    const index = Number(button.dataset.editDraftInputIndex);
+    const input = modelDraftInputs[index];
+
+    if (!input) return;
+
+    modelDraftEditingInputIndex = index;
+    modelDraftInputForm = {
+      inputMaterial: input.inputMaterial || "Selecione um material",
+      inputCode: input.inputCode || "",
+      consumptionMode: input.consumptionMode || "Fixo",
+      inputQuantity: input.inputQuantity || "",
+      inputUnit: input.inputUnit || "un",
+      notes: input.notes || ""
+    };
 
     activeMaterialTab = "modelos";
     rerenderMateriais();
@@ -1305,6 +1457,11 @@ removeDraftInputButtons.forEach((button) => {
 
 saveProductionModelBtn?.addEventListener("click", async () => {
   const material = materials[selectedMaterialIndex];
+
+  if (!material?.canBeProduced) {
+    alert("Modelos de produção ficam disponíveis apenas para materiais que provêm de produção.");
+    return;
+  }
 
   const modelName = document.getElementById("modelNameInput").value.trim();
   const outputQuantity = document.getElementById("modelOutputQuantityInput").value.trim();
@@ -1443,7 +1600,7 @@ async function loadMaterialReferencesFromApi() {
     lineStore.machines.splice(0, lineStore.machines.length, ...apiMachines.map(normalizeMachine));
     rerenderMateriais();
   } catch (error) {
-    console.log("API indisponÃ­vel, usando referÃªncias locais");
+    console.log("API indisponível, usando referências locais");
   }
 }
 
@@ -1457,7 +1614,7 @@ async function loadMaterialsFromApi() {
     materials.splice(0, materials.length, ...apiMaterials.map(normalizeMaterial).filter(isActiveItem));
     rerenderMateriais();
   } catch (error) {
-    console.log("API indisponÃ­vel, usando materiais locais");
+    console.log("API indisponível, usando materiais locais");
   }
 }
 
@@ -1471,14 +1628,14 @@ async function createMaterial(payload) {
       return null;
     }
 
-    console.log("API indisponÃ­vel, usando materiais locais");
+    console.log("API indisponível, usando materiais locais");
     return normalizeMaterial(payload);
   }
 }
 
 async function updateMaterial(material, payload) {
   if (!material.id) {
-    alert("Este material ainda nÃ£o possui ID da API. Recarregue os materiais da API antes de editar.");
+    alert("Este material ainda não possui ID da API. Recarregue os materiais da API antes de editar.");
     return null;
   }
 
@@ -1491,7 +1648,7 @@ async function updateMaterial(material, payload) {
       return null;
     }
 
-    console.log("API indisponÃ­vel, usando materiais locais");
+    console.log("API indisponível, usando materiais locais");
     return normalizeMaterial({
       ...material,
       ...payload
@@ -1501,7 +1658,7 @@ async function updateMaterial(material, payload) {
 
 async function deleteMaterial(material) {
   if (!material.id) {
-    alert("Este material ainda nÃ£o possui ID da API. Recarregue os materiais da API antes de inativar.");
+    alert("Este material ainda não possui ID da API. Recarregue os materiais da API antes de inativar.");
     return null;
   }
 
@@ -1514,7 +1671,7 @@ async function deleteMaterial(material) {
       return null;
     }
 
-    console.log("API indisponÃ­vel, usando materiais locais");
+    console.log("API indisponível, usando materiais locais");
     return normalizeMaterial({
       ...material,
       status: "Inativo"
@@ -1527,20 +1684,20 @@ function normalizeMaterial(material) {
     id: material.id,
     code: material.code || "",
     name: material.name || "",
-    type: material.type || "",
-    materialTypeId: material.materialTypeId || null,
-    lotCode: material.lotCode || "",
-    unit: material.unit || material.primaryUnit || "un",
-    primaryUnit: material.primaryUnit || material.unit || "un",
-    secondaryUnit: material.secondaryUnit || "",
-    secondaryUnitMode: material.secondaryUnitMode || "manual",
-    fixedPrimaryQuantity: formatDecimalValue(material.fixedPrimaryQuantity),
-    fixedSecondaryQuantity: formatDecimalValue(material.fixedSecondaryQuantity),
+    type: material.type || material.materialType || "",
+    materialTypeId: material.materialTypeId || material.material_type_id || null,
+    lotCode: material.lotCode || material.lot_code || "",
+    unit: material.unit || material.primaryUnit || material.primary_unit || "un",
+    primaryUnit: material.primaryUnit || material.primary_unit || material.unit || "un",
+    secondaryUnit: material.secondaryUnit || material.secondary_unit || "",
+    secondaryUnitMode: material.secondaryUnitMode || material.secondary_unit_mode || "manual",
+    fixedPrimaryQuantity: formatDecimalValue(material.fixedPrimaryQuantity ?? material.fixed_primary_quantity),
+    fixedSecondaryQuantity: formatDecimalValue(material.fixedSecondaryQuantity ?? material.fixed_secondary_quantity),
     allowedLocations: Array.isArray(material.allowedLocations) ? material.allowedLocations : [],
-    canBePurchased: Boolean(material.canBePurchased ?? material.purchasable),
-    canBeProduced: Boolean(material.canBeProduced ?? material.producible),
-    controlsMinStock: Boolean(material.controlsMinStock ?? material.controlsMinimumStock),
-    minStock: formatDecimalValue(material.minStock ?? material.minimumStockQuantity),
+    canBePurchased: Boolean(material.canBePurchased ?? material.purchasable ?? material.can_be_purchased),
+    canBeProduced: Boolean(material.canBeProduced ?? material.producible ?? material.can_be_produced),
+    controlsMinStock: Boolean(material.controlsMinStock ?? material.controlsMinimumStock ?? material.controls_min_stock),
+    minStock: formatDecimalValue(material.minStock ?? material.minimumStockQuantity ?? material.min_stock),
     traceable: material.traceable === undefined ? true : Boolean(material.traceable),
     notes: material.notes || "",
     status: material.status || "Ativo",

@@ -27,10 +27,10 @@ function normalizePayload(body) {
     unit: normalizeText(body.unit),
     baseValue: normalizeDecimal(body.baseValue),
     toleranceMode: normalizeText(body.toleranceMode),
-    minTolerancePercent: normalizeDecimal(body.minTolerancePercent),
-    minToleranceNumber: normalizeDecimal(body.minToleranceNumber),
-    maxTolerancePercent: normalizeDecimal(body.maxTolerancePercent),
-    maxToleranceNumber: normalizeDecimal(body.maxToleranceNumber),
+    minTolerancePercent: normalizeDecimal(body.minTolerancePercent ?? body.tolerance_min_percent),
+    minToleranceNumber: normalizeDecimal(body.minToleranceNumber ?? body.tolerance_min_value),
+    maxTolerancePercent: normalizeDecimal(body.maxTolerancePercent ?? body.tolerance_max_percent),
+    maxToleranceNumber: normalizeDecimal(body.maxToleranceNumber ?? body.tolerance_max_value),
     notes: normalizeText(body.notes),
     status: normalizeText(body.status) || "Ativo"
   };

@@ -1,4 +1,4 @@
-import { pages } from "../../pages/index.js?v=purchase-neon";
+import { pages } from "../../pages/index.js?v=expedition-api";
 
 export function setupNavigation() {
   document.querySelectorAll(".nav-item").forEach((button) => {

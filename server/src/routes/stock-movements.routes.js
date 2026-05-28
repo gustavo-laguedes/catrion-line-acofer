@@ -1,8 +1,8 @@
-const express = require("express");
+﻿const express = require("express");
 const { pool, query } = require("../db");
 
 const router = express.Router();
-const INTERNAL_ERROR = { error: "Erro interno ao processar movimentacoes de estoque." };
+const INTERNAL_ERROR = { error: "Erro interno ao processar movimentações de estoque." };
 
 function normalizeText(value) {
   const text = String(value || "").trim();
@@ -22,11 +22,27 @@ function normalizeDecimal(value) {
   return Number.isFinite(number) ? number : 0;
 }
 
+function roundDecimal(value) {
+  return Math.round(Number(value || 0) * 1000000) / 1000000;
+}
+
+function calculateProportionalSecondaryQuantity(primaryQuantity, primaryBalance, secondaryBalance) {
+  if (primaryBalance <= 0 || secondaryBalance <= 0) return null;
+
+  return roundDecimal(normalizeDecimal(primaryQuantity) * (secondaryBalance / primaryBalance));
+}
+
 function normalizeDate(value) {
   const text = normalizeText(value);
   if (!text) return new Date().toISOString();
   if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return `${text}T12:00:00`;
   return text;
+}
+
+async function ensurePurchaseCertificateColumns(client) {
+  await client.query("alter table stock_movements add column if not exists supplier_certificate_number text");
+  await client.query("alter table stock_movement_lots add column if not exists supplier_certificate_number text");
+  await client.query("alter table lots add column if not exists supplier_certificate_number text");
 }
 
 function toDateOnly(value) {
@@ -44,7 +60,23 @@ function normalizePurchasePayload(body) {
     locationId: body.locationId || body.destinationLocationId || null,
     locationName: normalizeText(body.locationName || body.destinationLocation),
     documentNumber: normalizeText(body.documentNumber || body.fiscalNumber),
+    supplierCertificateNumber: normalizeText(body.supplierCertificateNumber),
     notes: normalizeText(body.notes || body.observation),
+    items: Array.isArray(body.items) ? body.items : []
+  };
+}
+
+function normalizeTransferPayload(body) {
+  return {
+    type: normalizeText(body.type || body.movementType) || "TRANSFER",
+    movementDate: normalizeDate(body.movementDate || body.dateTime || body.date),
+    originLocationId: body.originLocationId || body.sourceLocationId || null,
+    originLocationName: normalizeText(body.originLocationName || body.originLocation || body.sourceLocationName),
+    destinationLocationId: body.destinationLocationId || null,
+    destinationLocationName: normalizeText(body.destinationLocationName || body.destinationLocation),
+    documentNumber: normalizeText(body.documentNumber || body.fiscalNumber),
+    notes: normalizeText(body.notes || body.observation),
+    stockExitMode: normalizeText(body.stockExitMode),
     items: Array.isArray(body.items) ? body.items : []
   };
 }
@@ -60,7 +92,7 @@ async function resolveByIdOrName(client, table, id, name, label) {
     if (result.rows.length) return result.rows[0].id;
   }
 
-  throw Object.assign(new Error(`${label} nao encontrado.`), { status: 400 });
+  throw Object.assign(new Error(`${label} não encontrado.`), { status: 400 });
 }
 
 async function resolveMaterial(client, item) {
@@ -103,10 +135,10 @@ async function resolveMaterial(client, item) {
     if (result.rows.length) return result.rows[0];
   }
 
-  throw Object.assign(new Error(`Material ${item.materialName || item.materialCode || ""} nao encontrado.`), { status: 400 });
+  throw Object.assign(new Error(`Material ${item.materialName || item.materialCode || ""} não encontrado.`), { status: 400 });
 }
 
-async function findOrCreatePurchaseLot(client, { lotCode, material, movementId, locationId, movementDate }) {
+async function findOrCreatePurchaseLot(client, { lotCode, material, movementId, locationId, movementDate, supplierCertificateNumber }) {
   const existing = await client.query(
     `
       select id, material_id
@@ -119,16 +151,19 @@ async function findOrCreatePurchaseLot(client, { lotCode, material, movementId, 
 
   if (existing.rows.length) {
     if (existing.rows[0].material_id !== material.id) {
-      throw Object.assign(new Error(`Lote ${lotCode} ja existe para outro material.`), { status: 409 });
+      throw Object.assign(new Error(`Lote ${lotCode} já existe para outro material.`), { status: 409 });
     }
 
     await client.query(
       `
         update lots
-        set current_location_id = $1, updated_at = now()
+        set
+          current_location_id = $1,
+          supplier_certificate_number = coalesce($3, supplier_certificate_number),
+          updated_at = now()
         where id = $2;
       `,
-      [locationId, existing.rows[0].id]
+      [locationId, existing.rows[0].id, supplierCertificateNumber]
     );
 
     return existing.rows[0].id;
@@ -143,12 +178,13 @@ async function findOrCreatePurchaseLot(client, { lotCode, material, movementId, 
         origin_id,
         production_date,
         current_location_id,
+        supplier_certificate_number,
         status
       )
-      values ($1, $2, 'PURCHASE', $3, $4::date, $5, 'Disponível')
+      values ($1, $2, 'PURCHASE', $3, $4::date, $5, $6, 'Disponível')
       returning id;
     `,
-    [lotCode, material.id, movementId, movementDate, locationId]
+    [lotCode, material.id, movementId, movementDate, locationId, supplierCertificateNumber]
   );
 
   return result.rows[0].id;
@@ -161,7 +197,7 @@ function validatePurchase(payload, res) {
   }
 
   if (!payload.locationId && !payload.locationName) {
-    res.status(400).json({ error: "Local de entrada e obrigatorio." });
+    res.status(400).json({ error: "Local de entrada é obrigatório." });
     return false;
   }
 
@@ -172,7 +208,7 @@ function validatePurchase(payload, res) {
 
   for (const item of payload.items) {
     if (!item.materialId && !item.materialCode && !item.materialName) {
-      res.status(400).json({ error: "Material e obrigatorio em todos os itens." });
+      res.status(400).json({ error: "Material é obrigatório em todos os itens." });
       return false;
     }
 
@@ -196,7 +232,73 @@ function validatePurchase(payload, res) {
     }
 
     if (lots.some((lot) => !normalizeText(lot.lotCode))) {
-      res.status(400).json({ error: `Existe lote sem codigo em ${item.materialName || item.materialCode}.` });
+      res.status(400).json({ error: `Existe lote sem código em ${item.materialName || item.materialCode}.` });
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function validateTransfer(payload, res) {
+  if (payload.type !== "TRANSFER") {
+    res.status(400).json({ error: "Tipo de movimentação de transferência inválido." });
+    return false;
+  }
+
+  if ((!payload.originLocationId && !payload.originLocationName) || (!payload.destinationLocationId && !payload.destinationLocationName)) {
+    res.status(400).json({ error: "Local de origem e local de destino são obrigatórios." });
+    return false;
+  }
+
+  if (
+    payload.originLocationId && payload.destinationLocationId &&
+    payload.originLocationId === payload.destinationLocationId
+  ) {
+    res.status(400).json({ error: "Origem e destino não podem ser iguais." });
+    return false;
+  }
+
+  if (
+    payload.originLocationName && payload.destinationLocationName &&
+    payload.originLocationName === payload.destinationLocationName
+  ) {
+    res.status(400).json({ error: "Origem e destino não podem ser iguais." });
+    return false;
+  }
+
+  if (!payload.items.length) {
+    res.status(400).json({ error: "Adicione pelo menos um item." });
+    return false;
+  }
+
+  for (const item of payload.items) {
+    if (!item.materialId && !item.materialCode && !item.materialName) {
+      res.status(400).json({ error: "Material é obrigatório em todos os itens." });
+      return false;
+    }
+
+    if (normalizeDecimal(item.quantity) <= 0) {
+      res.status(400).json({ error: "Quantidade do item deve ser maior que zero." });
+      return false;
+    }
+
+    const lots = Array.isArray(item.lots) ? item.lots : [];
+
+    if (!lots.length) {
+      res.status(400).json({ error: `Selecione pelo menos um lote para ${item.materialName || item.materialCode}.` });
+      return false;
+    }
+
+    const lotTotal = lots.reduce((sum, lot) => sum + normalizeDecimal(lot.quantity || lot.exitQuantity), 0);
+
+    if (Math.abs(lotTotal - normalizeDecimal(item.quantity)) > 0.0001) {
+      res.status(400).json({ error: `A soma dos lotes precisa bater com a quantidade de ${item.materialName || item.materialCode}.` });
+      return false;
+    }
+
+    if (lots.some((lot) => !normalizeText(lot.lotCode) && !lot.lotId && !lot.sourceLotId)) {
+      res.status(400).json({ error: `Existe lote sem identificacao em ${item.materialName || item.materialCode}.` });
       return false;
     }
   }
@@ -218,10 +320,16 @@ async function getMovementById(client, id) {
         sm.updated_at as "updatedAt",
         sm.supplier_id as "supplierId",
         s.name as "supplierName",
+        sm.origin_location_id as "originLocationId",
+        ol.name as "originLocation",
+        sm.destination_location_id as "destinationLocationId",
+        dl.name as "destinationLocation",
         sm.destination_location_id as "locationId",
-        dl.name as "locationName"
+        dl.name as "locationName",
+        sm.supplier_certificate_number as "supplierCertificateNumber"
       from stock_movements sm
       left join suppliers s on s.id = sm.supplier_id
+      left join locations ol on ol.id = sm.origin_location_id
       left join locations dl on dl.id = sm.destination_location_id
       where sm.id = $1
       limit 1;
@@ -263,7 +371,8 @@ async function getMovementById(client, id) {
           sml.secondary_quantity as "secondaryQuantity",
           sml.current_location_id as "locationId",
           l.name as "locationName",
-          lo.production_date as "productionDate"
+          lo.production_date as "productionDate",
+          coalesce(sml.supplier_certificate_number, lo.supplier_certificate_number) as "supplierCertificateNumber"
         from stock_movement_lots sml
         left join locations l on l.id = sml.current_location_id
         left join lots lo on lo.id = sml.lot_id
@@ -285,17 +394,22 @@ function normalizeMovementForClient(movement) {
   return {
     id: movement.id,
     type: movement.movementType,
-    typeLabel: movement.movementType === "PURCHASE" ? "Compra" : movement.movementType,
+    typeLabel: movement.movementType === "PURCHASE" ? "Compra" : movement.movementType === "TRANSFER" ? "Transferencia" : movement.movementType,
     sourceType: "API",
     sourceLabel: "Neon",
     dateTime: movement.movementDate,
     movementDate: toDateOnly(movement.movementDate),
     locationId: movement.locationId,
     locationName: movement.locationName || "",
+    originLocationId: movement.originLocationId || "",
+    originLocation: movement.originLocation || "",
+    destinationLocationId: movement.destinationLocationId || "",
+    destinationLocation: movement.destinationLocation || movement.locationName || "",
     supplierId: movement.supplierId,
     supplierName: movement.supplierName || "",
     fiscalNumber: movement.documentNumber || "",
     documentNumber: movement.documentNumber || "",
+    supplierCertificateNumber: movement.supplierCertificateNumber || "",
     observation: movement.notes || "",
     notes: movement.notes || "",
     status: movement.status || "Processado",
@@ -324,6 +438,7 @@ function normalizeMovementForClient(movement) {
         secondaryUnit: item.secondaryUnit || "",
         locationId: lot.locationId,
         locationName: lot.locationName || movement.locationName || "",
+        supplierCertificateNumber: lot.supplierCertificateNumber || movement.supplierCertificateNumber || "",
         productionDate: lot.productionDate || movement.movementDate
       }))
     }))
@@ -396,13 +511,129 @@ async function ensureCancelablePurchaseBalance(client, impacts) {
     const secondaryQuantity = normalizeDecimal(balance?.secondary_quantity);
 
     if (!balance || quantity + 0.0001 < impact.quantity) {
-      throw Object.assign(new Error("Saldo insuficiente para cancelar esta compra. O lote ja pode ter sido consumido ou movimentado."), { status: 409 });
+      throw Object.assign(new Error("Saldo insuficiente para cancelar esta compra. O lote já pode ter sido consumido ou movimentado."), { status: 409 });
     }
 
     if (impact.secondaryQuantity !== null && secondaryQuantity + 0.0001 < impact.secondaryQuantity) {
-      throw Object.assign(new Error("Saldo secundario insuficiente para cancelar esta compra."), { status: 409 });
+      throw Object.assign(new Error("Saldo secundário insuficiente para cancelar esta compra."), { status: 409 });
     }
   }
+}
+
+async function resolveTransferLot(client, item, material) {
+  const lotId = item.lotId || item.sourceLotId;
+
+  if (lotId) {
+    const result = await client.query(
+      `
+        select id, lot_code
+        from lots
+        where id = $1 and material_id = $2
+        limit 1;
+      `,
+      [lotId, material.id]
+    );
+
+    if (result.rows.length) return result.rows[0];
+  }
+
+  const lotCode = normalizeText(item.lotCode);
+
+  if (lotCode) {
+    const result = await client.query(
+      `
+        select id, lot_code
+        from lots
+        where lot_code = $1 and material_id = $2
+        limit 1;
+      `,
+      [lotCode.toUpperCase(), material.id]
+    );
+
+    if (result.rows.length) return result.rows[0];
+  }
+
+  throw Object.assign(new Error(`Lote ${item.lotCode || item.lotId || ""} não encontrado.`), { status: 400 });
+}
+
+async function ensureTransferLotBalance(client, { lotId, locationId, quantity, secondaryQuantity }) {
+  const result = await client.query(
+    `
+      select quantity, secondary_quantity
+      from stock_balances
+      where lot_id = $1 and location_id = $2
+      for update;
+    `,
+    [lotId, locationId]
+  );
+
+  const balance = result.rows[0];
+  const balanceQuantity = normalizeDecimal(balance?.quantity);
+  const balanceSecondaryQuantity = normalizeDecimal(balance?.secondary_quantity);
+  const calculatedSecondaryQuantity = calculateProportionalSecondaryQuantity(quantity, balanceQuantity, balanceSecondaryQuantity);
+
+  if (!balance || balanceQuantity + 0.0001 < quantity) {
+    throw Object.assign(new Error("Saldo insuficiente no local de origem para transferir o lote."), { status: 409 });
+  }
+
+  if (secondaryQuantity !== null && calculatedSecondaryQuantity !== null && Math.abs(secondaryQuantity - calculatedSecondaryQuantity) > 0.0001) {
+    throw Object.assign(new Error("Quantidade secundária inconsistente para transferir o lote."), { status: 400 });
+  }
+
+  const effectiveSecondaryQuantity = calculatedSecondaryQuantity ?? secondaryQuantity;
+
+  if (effectiveSecondaryQuantity !== null && balanceSecondaryQuantity + 0.0001 < effectiveSecondaryQuantity) {
+    throw Object.assign(new Error("Saldo secundário insuficiente no local de origem para transferir o lote."), { status: 409 });
+  }
+
+  return {
+    quantity,
+    secondaryQuantity: effectiveSecondaryQuantity
+  };
+}
+
+async function applyStockBalanceDelta(client, impact, direction) {
+  const quantityDelta = normalizeDecimal(impact.quantity) * direction;
+  const secondaryDelta = impact.secondaryQuantity === null ? null : normalizeDecimal(impact.secondaryQuantity) * direction;
+
+  await client.query(
+    `
+      insert into stock_balances (
+        lot_id,
+        material_id,
+        location_id,
+        quantity,
+        secondary_quantity,
+        unit,
+        secondary_unit,
+        status
+      )
+      values ($1, $2, $3, $4, $5, $6, $7, 'Disponível')
+      on conflict (lot_id, location_id)
+      do update set
+        quantity = stock_balances.quantity + excluded.quantity,
+        secondary_quantity = case
+          when stock_balances.secondary_quantity is null and excluded.secondary_quantity is null then null
+          else coalesce(stock_balances.secondary_quantity, 0) + coalesce(excluded.secondary_quantity, 0)
+        end,
+        unit = excluded.unit,
+        secondary_unit = excluded.secondary_unit,
+        status = case
+          when stock_balances.quantity + excluded.quantity > 0 then 'Disponível'
+          else 'Sem saldo'
+        end,
+        updated_at = now();
+    `,
+    [
+      impact.lotId,
+      impact.materialId,
+      impact.locationId,
+      quantityDelta,
+      secondaryDelta,
+      impact.unit,
+      impact.secondaryUnit
+    ]
+  );
 }
 
 async function applyPurchaseImpact(client, movementId, direction) {
@@ -511,18 +742,19 @@ async function changePurchaseMovementStatus(req, res, nextStatus, direction) {
   const client = await pool.connect();
 
   try {
+    await ensurePurchaseCertificateColumns(client);
     await client.query("begin");
 
     const movement = await getMovementForStatusChange(client, req.params.id);
 
     if (!movement) {
       await client.query("rollback");
-      return res.status(404).json({ error: "Movimentacao nao encontrada." });
+      return res.status(404).json({ error: "Movimentação não encontrada." });
     }
 
     if (movement.movementType !== "PURCHASE") {
       await client.query("rollback");
-      return res.status(400).json({ error: "Neste momento cancelamento/reprocessamento via API esta disponivel apenas para compras." });
+      return res.status(400).json({ error: "Neste momento, cancelamento/reprocessamento via API está disponível apenas para compras." });
     }
 
     const shouldApplyImpact = direction < 0
@@ -549,7 +781,7 @@ async function changePurchaseMovementStatus(req, res, nextStatus, direction) {
   } catch (error) {
     await client.query("rollback");
     return res.status(error.status || 500).json({
-      error: error.status ? error.message : "Erro interno ao alterar status da movimentacao.",
+      error: error.status ? error.message : "Erro interno ao alterar status da movimentação.",
       detail: error.status ? null : error.message
     });
   } finally {
@@ -561,10 +793,10 @@ router.get("/", async (req, res) => {
   const client = await pool.connect();
 
   try {
+    await ensurePurchaseCertificateColumns(client);
     const result = await client.query(`
       select id
       from stock_movements
-      where movement_type = 'PURCHASE'
       order by movement_date desc, created_at desc;
     `);
 
@@ -576,7 +808,7 @@ router.get("/", async (req, res) => {
 
     return res.json(movements.filter(Boolean));
   } catch (error) {
-    console.error("Erro ao listar movimentacoes de estoque:", error);
+    console.error("Erro ao listar movimentações de estoque:", error);
     return res.status(500).json(INTERNAL_ERROR);
   } finally {
     client.release();
@@ -591,7 +823,216 @@ router.post("/:id/reprocess", async (req, res) => {
   return changePurchaseMovementStatus(req, res, "Reprocessado", 1);
 });
 
+async function registerTransferMovement(req, res) {
+  const payload = normalizeTransferPayload(req.body || {});
+
+  if (!validateTransfer(payload, res)) return null;
+
+  const client = await pool.connect();
+
+  try {
+    console.info("Iniciando registro de transferência no estoque:", {
+      documentNumber: payload.documentNumber,
+      originLocationName: payload.originLocationName,
+      destinationLocationName: payload.destinationLocationName,
+      items: payload.items.length
+    });
+
+    await ensurePurchaseCertificateColumns(client);
+    await client.query("begin");
+
+    const originLocationId = await resolveByIdOrName(
+      client,
+      "locations",
+      payload.originLocationId,
+      payload.originLocationName,
+      "Local de origem"
+    );
+    const destinationLocationId = await resolveByIdOrName(
+      client,
+      "locations",
+      payload.destinationLocationId,
+      payload.destinationLocationName,
+      "Local de destino"
+    );
+
+    if (originLocationId === destinationLocationId) {
+      throw Object.assign(new Error("Origem e destino não podem ser iguais."), { status: 400 });
+    }
+
+    const movementResult = await client.query(
+      `
+        insert into stock_movements (
+          movement_type,
+          movement_date,
+          status,
+          origin_location_id,
+          destination_location_id,
+          document_number,
+          notes
+        )
+        values ('TRANSFER', $1, 'Processado', $2, $3, $4, $5)
+        returning id;
+      `,
+      [payload.movementDate, originLocationId, destinationLocationId, payload.documentNumber, payload.notes]
+    );
+
+    const movementId = movementResult.rows[0].id;
+
+    for (const item of payload.items) {
+      const material = await resolveMaterial(client, item);
+      const quantity = normalizeDecimal(item.quantity);
+      const unit = normalizeText(item.unit) || material.unit || "un";
+      const secondaryUnit = normalizeText(item.secondaryUnit) || material.secondary_unit || null;
+      const preparedLots = [];
+
+      for (const lot of item.lots) {
+        const lotQuantity = normalizeDecimal(lot.quantity || lot.exitQuantity);
+        const clientLotSecondaryQuantity = lot.secondaryQuantity === undefined || lot.secondaryQuantity === null || lot.secondaryQuantity === ""
+          ? null
+          : normalizeDecimal(lot.secondaryQuantity);
+        const resolvedLot = await resolveTransferLot(client, lot, material);
+        const lotCode = normalizeText(lot.lotCode || resolvedLot.lot_code).toUpperCase();
+        const checkedBalance = await ensureTransferLotBalance(client, {
+          lotId: resolvedLot.id,
+          locationId: originLocationId,
+          quantity: lotQuantity,
+          secondaryQuantity: clientLotSecondaryQuantity
+        });
+
+        preparedLots.push({
+          lot,
+          resolvedLot,
+          lotCode,
+          quantity: lotQuantity,
+          secondaryQuantity: secondaryUnit ? checkedBalance.secondaryQuantity : null
+        });
+      }
+
+      const calculatedSecondaryQuantity = preparedLots.reduce((sum, lot) => {
+        return sum + normalizeDecimal(lot.secondaryQuantity);
+      }, 0);
+      const secondaryQuantity = secondaryUnit && calculatedSecondaryQuantity > 0 ? roundDecimal(calculatedSecondaryQuantity) : null;
+
+      const itemResult = await client.query(
+        `
+          insert into stock_movement_items (
+            movement_id,
+            material_id,
+            quantity,
+            unit,
+            secondary_quantity,
+            secondary_unit,
+            notes
+          )
+          values ($1, $2, $3, $4, $5, $6, $7)
+          returning id;
+        `,
+        [movementId, material.id, quantity, unit, secondaryQuantity, secondaryUnit, normalizeText(item.notes)]
+      );
+
+      const movementItemId = itemResult.rows[0].id;
+
+      for (const preparedLot of preparedLots) {
+        await client.query(
+          `
+            insert into stock_movement_lots (
+              movement_item_id,
+              lot_id,
+              lot_code,
+              quantity,
+              secondary_quantity,
+              current_location_id,
+              destination_location_id,
+              notes
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8);
+          `,
+          [
+            movementItemId,
+            preparedLot.resolvedLot.id,
+            preparedLot.lotCode,
+            preparedLot.quantity,
+            preparedLot.secondaryQuantity,
+            originLocationId,
+            destinationLocationId,
+            normalizeText(preparedLot.lot.notes)
+          ]
+        );
+
+        await applyStockBalanceDelta(client, {
+          lotId: preparedLot.resolvedLot.id,
+          materialId: material.id,
+          locationId: originLocationId,
+          quantity: preparedLot.quantity,
+          secondaryQuantity: preparedLot.secondaryQuantity,
+          unit,
+          secondaryUnit
+        }, -1);
+
+        await applyStockBalanceDelta(client, {
+          lotId: preparedLot.resolvedLot.id,
+          materialId: material.id,
+          locationId: destinationLocationId,
+          quantity: preparedLot.quantity,
+          secondaryQuantity: preparedLot.secondaryQuantity,
+          unit,
+          secondaryUnit
+        }, 1);
+      }
+    }
+
+    await client.query(
+      `
+        update stock_balances
+        set
+          quantity = 0,
+          secondary_quantity = case when secondary_quantity is null then null else greatest(secondary_quantity, 0) end,
+          status = 'Sem saldo',
+          updated_at = now()
+        where location_id = $1 and quantity < 0.0001;
+      `,
+      [originLocationId]
+    );
+
+    await refreshLotsForMovement(client, movementId);
+
+    const movement = await getMovementById(client, movementId);
+    await client.query("commit");
+
+    console.info("Transferencia registrada com sucesso:", { movementId });
+    return res.status(201).json(movement);
+  } catch (error) {
+    await client.query("rollback");
+    console.error("Erro ao registrar transferência:", {
+      message: error.message,
+      detail: error.detail,
+      code: error.code,
+      constraint: error.constraint
+    });
+
+    if (error.status) {
+      return res.status(error.status).json({ error: error.message });
+    }
+
+    return res.status(500).json({
+      error: "Erro interno ao registrar transferência.",
+      detail: error.detail || error.message || null,
+      code: error.code || null,
+      constraint: error.constraint || null
+    });
+  } finally {
+    client.release();
+  }
+}
+
 router.post("/", async (req, res) => {
+  const requestedType = normalizeText(req.body?.type || req.body?.movementType) || "PURCHASE";
+
+  if (requestedType === "TRANSFER") {
+    return registerTransferMovement(req, res);
+  }
+
   const payload = normalizePurchasePayload(req.body || {});
 
   if (!validatePurchase(payload, res)) return null;
@@ -606,6 +1047,7 @@ router.post("/", async (req, res) => {
       items: payload.items.length
     });
 
+    await ensurePurchaseCertificateColumns(client);
     await client.query("begin");
 
     const locationId = await resolveByIdOrName(client, "locations", payload.locationId, payload.locationName, "Local");
@@ -622,12 +1064,13 @@ router.post("/", async (req, res) => {
           destination_location_id,
           supplier_id,
           document_number,
+          supplier_certificate_number,
           notes
         )
-        values ('PURCHASE', $1, 'Processado', $2, $3, $4, $5)
+        values ('PURCHASE', $1, 'Processado', $2, $3, $4, $5, $6)
         returning id;
       `,
-      [payload.movementDate, locationId, supplierId, payload.documentNumber, payload.notes]
+      [payload.movementDate, locationId, supplierId, payload.documentNumber, payload.supplierCertificateNumber, payload.notes]
     );
 
     const movementId = movementResult.rows[0].id;
@@ -673,7 +1116,8 @@ router.post("/", async (req, res) => {
           material,
           movementId,
           locationId,
-          movementDate: payload.movementDate
+          movementDate: payload.movementDate,
+          supplierCertificateNumber: normalizeText(lot.supplierCertificateNumber) || payload.supplierCertificateNumber
         });
 
         await client.query(
@@ -686,11 +1130,12 @@ router.post("/", async (req, res) => {
               secondary_quantity,
               current_location_id,
               destination_location_id,
+              supplier_certificate_number,
               notes
             )
-            values ($1, $2, $3, $4, $5, $6, $6, $7);
+            values ($1, $2, $3, $4, $5, $6, $6, $7, $8);
           `,
-          [movementItemId, lotId, lotCode, lotQuantity, lotSecondaryQuantity, locationId, normalizeText(lot.notes)]
+          [movementItemId, lotId, lotCode, lotQuantity, lotSecondaryQuantity, locationId, normalizeText(lot.supplierCertificateNumber) || payload.supplierCertificateNumber, normalizeText(lot.notes)]
         );
 
         await client.query(
@@ -759,3 +1204,4 @@ router.post("/", async (req, res) => {
 });
 
 module.exports = router;
+

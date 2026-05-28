@@ -25,7 +25,7 @@ function normalizePayload(body) {
     materialTypeId: body.materialTypeId || null,
     type: normalizeText(body.type),
     lotCode: normalizeText(body.lotCode)?.toUpperCase() || null,
-    primaryUnit: normalizeText(body.primaryUnit || body.unit) || "un",
+    unit: normalizeText(body.unit || body.primaryUnit) || "un",
     secondaryUnit: normalizeText(body.secondaryUnit),
     secondaryUnitMode: normalizeText(body.secondaryUnitMode) || "manual",
     fixedPrimaryQuantity: normalizeDecimal(body.fixedPrimaryQuantity),
@@ -57,7 +57,7 @@ function validatePayload(payload, res) {
     return false;
   }
 
-  if (!payload.materialTypeId && !payload.type) {
+    if (!payload.materialTypeId && !payload.type) {
     res.status(400).json({ error: "Tipo de material é obrigatório." });
     return false;
   }
@@ -71,6 +71,11 @@ function validatePayload(payload, res) {
     payload.fixedPrimaryQuantity === null || payload.fixedSecondaryQuantity === null
   )) {
     res.status(400).json({ error: "Conversão fixa exige as duas quantidades." });
+    return false;
+  }
+
+  if (!payload.purchasable && !payload.producible) {
+    res.status(400).json({ error: "Selecione pelo menos uma origem: compra ou produção." });
     return false;
   }
 
@@ -101,6 +106,42 @@ function materialSaveErrorResponse(error) {
     code: error?.code || null,
     constraint: error?.constraint || null
   };
+}
+
+async function getTableColumns(client, tableName) {
+  const result = await client.query(
+    `
+      select column_name
+      from information_schema.columns
+      where table_schema = current_schema()
+        and table_name = $1;
+    `,
+    [tableName]
+  );
+
+  return new Set(result.rows.map((row) => row.column_name));
+}
+
+async function getProductionModelInputColumns(client) {
+  const columns = await getTableColumns(client, "material_production_model_inputs");
+
+  if (!columns.has("consumption_mode")) {
+    await client.query(
+      "alter table material_production_model_inputs add column if not exists consumption_mode text not null default 'Fixo'"
+    );
+    columns.add("consumption_mode");
+  }
+
+  await client.query(
+    `
+      update material_production_model_inputs
+      set consumption_mode = 'Variável na produção'
+      where quantity is null
+        and coalesce(consumption_mode, 'Fixo') = 'Fixo';
+    `
+  );
+
+  return columns;
 }
 
 async function resolveOne(client, table, id, name, label) {
@@ -141,7 +182,7 @@ async function getMaterialById(client, id, includeInactive = true) {
         m.material_type_id as "materialTypeId",
         mt.name as type,
         m.lot_code as "lotCode",
-        m.primary_unit as unit,
+        m.unit,
         m.secondary_unit as "secondaryUnit",
         m.secondary_unit_mode as "secondaryUnitMode",
         m.fixed_primary_quantity as "fixedPrimaryQuantity",
@@ -192,6 +233,13 @@ async function getMaterialById(client, id, includeInactive = true) {
 }
 
 async function getProductionModels(client, materialId) {
+  const inputColumns = await getProductionModelInputColumns(client);
+  const inputMaterialExpression = inputColumns.has("material_id") && inputColumns.has("input_material_id")
+    ? "coalesce(mpi.input_material_id, mpi.material_id)"
+    : inputColumns.has("input_material_id")
+      ? "mpi.input_material_id"
+      : "mpi.material_id";
+
   const result = await client.query(
     `
       select
@@ -219,10 +267,10 @@ async function getProductionModels(client, materialId) {
           im.code as "inputCode",
           mpi.quantity as "inputQuantity",
           mpi.unit as "inputUnit",
-          'Fixo' as "consumptionMode",
+          coalesce(mpi.consumption_mode, 'Fixo') as "consumptionMode",
           mpi.notes
         from material_production_model_inputs mpi
-        join materials im on im.id = coalesce(mpi.input_material_id, mpi.material_id)
+        join materials im on im.id = ${inputMaterialExpression}
         where mpi.production_model_id = $1
         order by im.name asc;
       `,
@@ -259,6 +307,7 @@ router.get("/", async (req, res) => {
       client.release();
     }
   } catch (error) {
+    logMaterialSaveError(error);
     return res.status(500).json(INTERNAL_ERROR);
   }
 });
@@ -283,14 +332,11 @@ router.post("/", async (req, res) => {
           name,
           material_type_id,
           lot_code,
-          primary_unit,
+          unit,
           secondary_unit,
           secondary_unit_mode,
           fixed_primary_quantity,
           fixed_secondary_quantity,
-          unit,
-          can_be_purchased,
-          can_be_produced,
           controls_min_stock,
           min_stock,
           purchasable,
@@ -299,7 +345,7 @@ router.post("/", async (req, res) => {
           notes,
           status
         )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $5, $12, $13, $10, $11, $12, $13, $14, $15, $16)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         returning id;
       `,
       [
@@ -307,7 +353,7 @@ router.post("/", async (req, res) => {
         payload.name,
         materialTypeId,
         payload.lotCode,
-        payload.primaryUnit,
+        payload.unit,
         payload.secondaryUnit,
         payload.secondaryUnitMode,
         payload.secondaryUnitMode === "fixed" ? payload.fixedPrimaryQuantity : null,
@@ -374,14 +420,11 @@ router.put("/:id", async (req, res) => {
           name = $2,
           material_type_id = $3,
           lot_code = $4,
-          primary_unit = $5,
+          unit = $5,
           secondary_unit = $6,
           secondary_unit_mode = $7,
           fixed_primary_quantity = $8,
           fixed_secondary_quantity = $9,
-          unit = $5,
-          can_be_purchased = $12,
-          can_be_produced = $13,
           controls_min_stock = $10,
           min_stock = $11,
           purchasable = $12,
@@ -398,7 +441,7 @@ router.put("/:id", async (req, res) => {
         payload.name,
         materialTypeId,
         payload.lotCode,
-        payload.primaryUnit,
+        payload.unit,
         payload.secondaryUnit,
         payload.secondaryUnitMode,
         payload.secondaryUnitMode === "fixed" ? payload.fixedPrimaryQuantity : null,
@@ -506,6 +549,7 @@ async function replaceMaterialRelations(client, materialId, locationIds, machine
 }
 
 async function replaceProductionModels(client, materialId, models) {
+  const inputColumns = await getProductionModelInputColumns(client);
   await client.query("delete from material_production_models where material_id = $1", [materialId]);
 
   for (const model of models) {
@@ -548,25 +592,35 @@ async function replaceProductionModels(client, materialId, models) {
         "Material consumido"
       );
 
+      const insertColumns = ["production_model_id"];
+      const values = [productionModelId];
+
+      if (inputColumns.has("material_id")) {
+        insertColumns.push("material_id");
+        values.push(inputMaterialId);
+      }
+
+      if (inputColumns.has("input_material_id")) {
+        insertColumns.push("input_material_id");
+        values.push(inputMaterialId);
+      }
+
+      insertColumns.push("quantity", "unit", "consumption_mode", "notes");
+      values.push(
+        normalizeDecimal(input.quantity ?? input.inputQuantity),
+        normalizeText(input.unit || input.inputUnit),
+        normalizeText(input.consumptionMode) || "Fixo",
+        normalizeText(input.notes)
+      );
+
+      const placeholders = values.map((_, index) => `$${index + 1}`).join(", ");
+
       await client.query(
         `
-          insert into material_production_model_inputs (
-            production_model_id,
-            material_id,
-            input_material_id,
-            quantity,
-            unit,
-            notes
-          )
-          values ($1, $2, $2, $3, $4, $5);
+          insert into material_production_model_inputs (${insertColumns.join(", ")})
+          values (${placeholders});
         `,
-        [
-          productionModelId,
-          inputMaterialId,
-          normalizeDecimal(input.quantity ?? input.inputQuantity),
-          normalizeText(input.unit || input.inputUnit),
-          normalizeText(input.notes)
-        ]
+        values
       );
     }
   }

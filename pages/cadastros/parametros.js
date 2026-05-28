@@ -1,9 +1,12 @@
-import { lineStore, getMaterialOptions, unitOptions } from "../../shared/data-store.js";
+import { lineStore, getMaterialOptions, getStockLossParameters, saveStockLossParameters } from "../../shared/data-store.js";
 import { apiDelete, apiGet, apiPost, apiPut } from "../../shared/api-client.js";
+import { parametrosExpedicaoPage } from "./parametros-expedicao.js";
 
 const technicalParameters = lineStore.technicalParameters;
+const technicalUnitOptions = ["kg/m", "kg", "g/m", "mm", "MPa", "%", "un"];
 let hasTriedApiLoad = false;
 let hasTriedMaterialLoad = false;
+let hasTriedStockLossLoad = false;
 
 /*
 const unitOptions = [
@@ -24,29 +27,36 @@ let selectedParameterIndex = null;
 let isEditingParameter = false;
 let isDeleteWarningOpen = false;
 let toleranceMode = "percentual";
+let activeParameterTab = "quality";
+let stockParametersNotice = null;
 
 export const parametrosPage = {
-  title: "📐 Parâmetros técnicos",
-  subtitle: "Cadastre regras, fatores, tolerâncias e configurações técnicas usadas nos cálculos",
+  title: "Parâmetros",
+  subtitle: "Cadastre regras, fatores, tolerâncias e configurações usadas nos cálculos e na operação",
   render: renderParametros,
   afterRender: setupParametrosEvents
 };
 
 function renderParametros() {
   ensureProductionLotPattern();
+  ensureStockLossParameters();
 
   return `
     <div class="module-toolbar">
       <button class="secondary-btn" data-route="cadastros">← Voltar</button>
 
       <div class="module-toolbar-actions">
-        <button class="primary-btn" id="openParameterModalBtn">Novo parâmetro</button>
+        ${activeParameterTab === "quality" ? `<button class="primary-btn" id="openParameterModalBtn">Novo parâmetro</button>` : ""}
       </div>
     </div>
 
-    ${renderProductionLotPatternCard()}
+    ${renderParameterTabs()}
 
-    <div class="card">
+    ${activeParameterTab === "lot" ? renderProductionLotPatternCard() : ""}
+    ${activeParameterTab === "stock" ? renderStockParametersCard() : ""}
+    ${activeParameterTab === "expedition" ? parametrosExpedicaoPage.render({ embedded: true }) : ""}
+
+    <div class="card ${activeParameterTab === "quality" ? "" : "hidden-parameter-section"}">
       <div class="table-header">
         <div>
           <h2>Parâmetros cadastrados</h2>
@@ -73,6 +83,25 @@ function renderParametros() {
   `;
 }
 
+function renderParameterTabs() {
+  const tabs = [
+    { key: "quality", label: "Parâmetros de qualidade" },
+    { key: "lot", label: "Parâmetros de lote" },
+    { key: "stock", label: "Parâmetros de estoque" },
+    { key: "expedition", label: "Parâmetros de expedição" }
+  ];
+
+  return `
+    <div class="parameter-tabs">
+      ${tabs.map((tab) => `
+        <button class="parameter-tab ${activeParameterTab === tab.key ? "active" : ""}" data-parameter-tab="${tab.key}" type="button">
+          ${tab.label}
+        </button>
+      `).join("")}
+    </div>
+  `;
+}
+
 function ensureProductionLotPattern() {
   if (!lineStore.productionLotPattern) {
     lineStore.productionLotPattern = {};
@@ -85,6 +114,76 @@ function ensureProductionLotPattern() {
     sequenceLength: Number(lineStore.productionLotPattern.sequenceLength || 2),
     resetRule: lineStore.productionLotPattern.resetRule || "data + material + máquina"
   };
+}
+
+function ensureStockLossParameters() {
+  return getStockLossParameters();
+}
+
+function renderStockParametersCard() {
+  const params = lineStore.stockLossParameters;
+  const materials = (lineStore.materials || []).filter(isActiveItem);
+
+  return `
+    <div class="card stock-parameters-card">
+      <div class="table-header">
+        <div>
+          <h2>Parâmetros de estoque</h2>
+          <p>Configure o percentual que dispara alerta e opcionalmente registra perda industrial do saldo remanescente.</p>
+        </div>
+      </div>
+
+      <div class="form-grid">
+        <label>
+          Percentual global de alerta/perda
+          <input id="globalLossPercentInput" type="number" min="0" max="100" step="0.1" value="${params.globalLossPercent}" />
+        </label>
+      </div>
+
+      <div class="data-table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Código</th>
+              <th>Material</th>
+              <th>Percentual específico</th>
+              <th>Aplicado</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${materials.map((material) => {
+              const key = material.code || material.name;
+              const override = params.materialLossPercents[key] ?? "";
+              const applied = override === "" ? params.globalLossPercent : override;
+              return `
+                <tr>
+                  <td><strong>${material.code || "-"}</strong></td>
+                  <td>${material.name || "-"}</td>
+                  <td>
+                    <input
+                      class="material-loss-percent-input"
+                      data-material-loss-key="${key}"
+                      type="number"
+                      min="0"
+                      max="100"
+                      step="0.1"
+                      value="${override}"
+                      placeholder="Usar global"
+                    />
+                  </td>
+                  <td>${applied}%</td>
+                </tr>
+              `;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="modal-footer">
+        <button class="primary-btn" id="saveStockLossParametersBtn" type="button">Salvar modificacoes</button>
+      </div>
+    </div>
+  `;
 }
 
 function renderProductionLotPatternCard() {
@@ -179,7 +278,7 @@ function renderParameterRow(parameter) {
       <td>${parameter.name}</td>
       <td>${parameter.material}</td>
       <td>${parameter.unit}</td>
-      <td>${parameter.baseValue || "-"}</td>
+      <td>${formatBaseValue(parameter.baseValue)}</td>
       <td>${formatTolerance(parameter, "min")}</td>
 <td>${formatTolerance(parameter, "max")}</td>
       <td><span class="badge ${statusClass}">${parameter.status}</span></td>
@@ -221,7 +320,7 @@ function renderParameterModal() {
           <label>
             Unidade
             <select id="parameterUnitInput">
-              ${renderSelectOptions(unitOptions)}
+              ${renderSelectOptions(technicalUnitOptions)}
             </select>
           </label>
 
@@ -292,13 +391,13 @@ function renderEditParameterModal(parameter) {
           <label>
             Unidade
             <select id="editParameterUnitInput" ${disabled}>
-              ${renderSelectOptions(unitOptions, parameter.unit)}
+              ${renderSelectOptions(technicalUnitOptions, parameter.unit)}
             </select>
           </label>
 
           <label>
             Valor base
-            <input id="editParameterBaseValueInput" type="text" inputmode="decimal" value="${parameter.baseValue || ""}" ${disabled} />
+            <input id="editParameterBaseValueInput" type="text" inputmode="decimal" value="${formatBaseInputValue(parameter.baseValue)}" ${disabled} />
           </label>
 
           </div>
@@ -400,7 +499,7 @@ function renderToleranceFields(parameter = {}, disabled = "", prefix = "") {
 
         <label>
           Numeral
-          <input id="${idPrefix}MinToleranceNumberInput" type="text" inputmode="decimal" value="${parameter.minToleranceNumber || ""}" placeholder="Ex: -0,004" ${numberDisabled} />
+          <input id="${idPrefix}MinToleranceNumberInput" type="text" inputmode="decimal" value="${formatToleranceNumberInputValue(parameter.minToleranceNumber)}" placeholder="Ex: 0,2090" ${numberDisabled} />
         </label>
       </div>
 
@@ -414,7 +513,7 @@ function renderToleranceFields(parameter = {}, disabled = "", prefix = "") {
 
         <label>
           Numeral
-          <input id="${idPrefix}MaxToleranceNumberInput" type="text" inputmode="decimal" value="${parameter.maxToleranceNumber || ""}" placeholder="Ex: 0,004" ${numberDisabled} />
+          <input id="${idPrefix}MaxToleranceNumberInput" type="text" inputmode="decimal" value="${formatToleranceNumberInputValue(parameter.maxToleranceNumber)}" placeholder="Ex: 0,2350" ${numberDisabled} />
         </label>
       </div>
     </div>
@@ -426,10 +525,37 @@ function formatTolerance(parameter, side) {
   const number = parameter[`${side}ToleranceNumber`];
 
   if (parameter.toleranceMode === "percentual") {
-    return percent ? `${percent}% / ${number || "-"} ${parameter.unit}` : "-";
+    return percent ? `${percent}% / ${formatToleranceNumber(number)} ${parameter.unit}` : "-";
   }
 
-  return number ? `${number} ${parameter.unit} / ${percent || "-"}%` : "-";
+  return number ? `${formatToleranceNumber(number)} ${parameter.unit} / ${percent || "-"}%` : "-";
+}
+
+function formatBaseValue(value) {
+  const formatted = formatDecimalDisplay(value, 3);
+  return formatted || "-";
+}
+
+function formatBaseInputValue(value) {
+  return formatDecimalDisplay(value, 3);
+}
+
+function formatToleranceNumber(value) {
+  return formatDecimalDisplay(value, 4) || "-";
+}
+
+function formatToleranceNumberInputValue(value) {
+  return formatDecimalDisplay(value, 4);
+}
+
+function formatDecimalDisplay(value, digits) {
+  if (value === null || value === undefined || value === "") return "";
+  const number = Number(String(value).replace(",", "."));
+  if (!Number.isFinite(number)) return String(value);
+  return number.toLocaleString("pt-BR", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits
+  });
 }
 
 function parseDecimal(value) {
@@ -437,9 +563,28 @@ function parseDecimal(value) {
   return Number(String(value).replace(",", "."));
 }
 
-function formatDecimal(value) {
+function formatDecimal(value, digits = 3) {
   if (value === null || Number.isNaN(value)) return "";
-  return value.toFixed(3).replace(".", ",");
+  return value.toFixed(digits).replace(".", ",");
+}
+
+function formatParameterDecimalInput(input) {
+  const value = parseDecimal(input.value);
+  if (value === null || !Number.isFinite(value)) return;
+
+  if (input.id.includes("BaseValue")) {
+    input.value = formatDecimal(value, 3);
+    return;
+  }
+
+  if (input.id.includes("ToleranceNumber")) {
+    input.value = formatDecimal(value, 4);
+    return;
+  }
+
+  if (input.id.includes("TolerancePercent")) {
+    input.value = formatDecimal(value, 3);
+  }
 }
 
 function calculateToleranceFields(prefix = "") {
@@ -460,11 +605,15 @@ function calculateToleranceFields(prefix = "") {
     const maxPercent = parseDecimal(maxPercentInput?.value);
 
     if (minPercent !== null) {
-      minNumberInput.value = formatDecimal(base - (base * (Math.abs(minPercent) / 100)));
+      const normalizedMinPercent = minPercent > 0 ? -minPercent : minPercent;
+      minPercentInput.value = formatDecimal(normalizedMinPercent);
+      minNumberInput.value = formatDecimal(base + (base * (normalizedMinPercent / 100)), 4);
     }
 
     if (maxPercent !== null) {
-      maxNumberInput.value = formatDecimal(base + (base * (Math.abs(maxPercent) / 100)));
+      const normalizedMaxPercent = Math.abs(maxPercent);
+      maxPercentInput.value = formatDecimal(normalizedMaxPercent);
+      maxNumberInput.value = formatDecimal(base + (base * (normalizedMaxPercent / 100)), 4);
     }
   }
 
@@ -529,6 +678,19 @@ function renderSelectOptions(options, selectedValue = "") {
 function setupParametrosEvents() {
   loadParameterMaterialsFromApi();
   loadTechnicalParametersFromApi();
+  loadStockLossParametersFromApi();
+
+  document.querySelectorAll("[data-parameter-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      activeParameterTab = button.dataset.parameterTab;
+      rerenderParametros();
+    });
+  });
+
+  document.getElementById("saveStockLossParametersBtn")?.addEventListener("click", saveStockLossParametersFromForm);
+  if (activeParameterTab === "expedition") {
+    parametrosExpedicaoPage.afterRender({ embedded: true });
+  }
 
   const modal = document.getElementById("parameterModal");
   const openBtn = document.getElementById("openParameterModalBtn");
@@ -571,6 +733,9 @@ toleranceInputs.forEach((input) => {
   input.addEventListener("input", () => {
     const prefix = input.id.startsWith("edit") ? "edit" : "";
     calculateToleranceFields(prefix);
+  });
+  input.addEventListener("blur", () => {
+    formatParameterDecimalInput(input);
   });
 });
 
@@ -730,6 +895,110 @@ async function loadTechnicalParametersFromApi() {
   }
 }
 
+async function loadStockLossParametersFromApi() {
+  if (hasTriedStockLossLoad) return;
+
+  hasTriedStockLossLoad = true;
+
+  try {
+    const parameters = await apiGet("/api/stock-loss-parameters");
+    saveStockLossParameters(normalizeStockLossParameters(parameters));
+    rerenderParametros();
+  } catch (error) {
+    console.log("API indisponivel, usando parametros de estoque locais");
+  }
+}
+
+function readStockLossParametersFromForm() {
+  const globalInput = document.getElementById("globalLossPercentInput");
+  const globalLossPercent = normalizePercent(globalInput?.value, 10);
+
+  const materialLossPercents = {};
+  document.querySelectorAll(".material-loss-percent-input").forEach((input) => {
+    const key = input.dataset.materialLossKey;
+    if (!key) return;
+    materialLossPercents[key] = input.value === "" ? "" : normalizePercent(input.value, globalLossPercent);
+  });
+
+  return {
+    globalLossPercent,
+    materialLossPercents
+  };
+}
+
+async function saveStockLossParametersFromForm() {
+  const payload = readStockLossParametersFromForm();
+
+  if (!isValidStockLossParameters(payload)) {
+    showStockParametersNotice("danger", "Erro ao salvar", "Informe percentuais entre 0 e 100.");
+    return;
+  }
+
+  try {
+    const savedParameters = await apiPut("/api/stock-loss-parameters", payload);
+    saveStockLossParameters(normalizeStockLossParameters(savedParameters));
+    rerenderParametros();
+    showStockParametersNotice("success", "Parametros salvos", "As modificacoes de estoque foram salvas com sucesso.");
+  } catch (error) {
+    showStockParametersNotice("danger", "Erro ao salvar", error.message || "Nao foi possivel salvar os parametros de estoque.");
+  }
+}
+
+function normalizeStockLossParameters(parameters = {}) {
+  return {
+    globalLossPercent: normalizePercent(parameters.globalLossPercent, 10),
+    materialLossPercents: parameters.materialLossPercents || {}
+  };
+}
+
+function normalizePercent(value, fallback = 10) {
+  if (value === "" || value === null || value === undefined) return fallback;
+  const number = Number(String(value).replace(",", "."));
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function isValidStockLossParameters(parameters) {
+  const values = [
+    parameters.globalLossPercent,
+    ...Object.values(parameters.materialLossPercents).filter((value) => value !== "")
+  ];
+
+  return values.every((value) => Number(value) >= 0 && Number(value) <= 100);
+}
+
+function showStockParametersNotice(type, title, message) {
+  stockParametersNotice = { type, title, message };
+  document.querySelector(".stock-parameters-notice-backdrop")?.remove();
+
+  const backdrop = document.createElement("div");
+  backdrop.className = `modal-backdrop open stock-parameters-notice-backdrop ${type === "danger" ? "danger-backdrop" : ""}`;
+  backdrop.innerHTML = `
+    <div class="modal stock-parameters-notice-modal ${type === "danger" ? "danger-modal" : ""}">
+      <div class="delete-alert-icon">${type === "danger" ? "!" : "OK"}</div>
+      <div class="modal-header vertical">
+        <div>
+          <h2>${title}</h2>
+          <p>${message}</p>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="primary-btn" id="closeStockParametersNoticeBtn" type="button">Fechar</button>
+      </div>
+    </div>
+  `;
+
+  document.getElementById("appContent")?.appendChild(backdrop);
+  backdrop.querySelector("#closeStockParametersNoticeBtn")?.addEventListener("click", closeStockParametersNotice);
+  backdrop.addEventListener("click", (event) => {
+    if (event.target === backdrop) closeStockParametersNotice();
+  });
+}
+
+function closeStockParametersNotice() {
+  stockParametersNotice = null;
+  document.querySelector(".stock-parameters-notice-backdrop")?.remove();
+}
+
 async function createTechnicalParameter(payload) {
   try {
     const parameter = await apiPost("/api/technical-parameters", payload);
@@ -799,12 +1068,12 @@ function normalizeTechnicalParameter(parameter) {
     materialId: parameter.materialId || null,
     material: parameter.material || getMaterialOptions()[0] || "Nao vincular material",
     unit: parameter.unit || "un",
-    baseValue: formatDecimalValue(parameter.baseValue),
+    baseValue: formatDecimalValue(parameter.baseValue, 3),
     toleranceMode: parameter.toleranceMode || "percentual",
-    minTolerancePercent: formatDecimalValue(parameter.minTolerancePercent),
-    minToleranceNumber: formatDecimalValue(parameter.minToleranceNumber),
-    maxTolerancePercent: formatDecimalValue(parameter.maxTolerancePercent),
-    maxToleranceNumber: formatDecimalValue(parameter.maxToleranceNumber),
+    minTolerancePercent: formatDecimalValue(parameter.minTolerancePercent, 3),
+    minToleranceNumber: formatDecimalValue(parameter.minToleranceNumber, 4),
+    maxTolerancePercent: formatDecimalValue(parameter.maxTolerancePercent, 3),
+    maxToleranceNumber: formatDecimalValue(parameter.maxToleranceNumber, 4),
     notes: parameter.notes || "",
     status: parameter.status || "Ativo",
     createdAt: parameter.createdAt,
@@ -821,9 +1090,14 @@ function normalizeMaterial(material) {
   };
 }
 
-function formatDecimalValue(value) {
+function formatDecimalValue(value, digits = null) {
   if (value === null || value === undefined || value === "") return "";
-  return String(value).replace(".", ",");
+  const number = Number(String(value).replace(",", "."));
+  if (!Number.isFinite(number) || digits === null) return String(value).replace(".", ",");
+  return number.toLocaleString("pt-BR", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits
+  });
 }
 
 function shouldUseLocalFallback(error) {

@@ -6,6 +6,7 @@ export function createPurchaseFormState(getToday) {
     supplierName: "",
     locationName: "",
     fiscalNumber: "",
+    supplierCertificateNumber: "",
     observation: ""
   };
 }
@@ -65,6 +66,11 @@ export function renderPurchaseHeaderFields({
       <label>
         Número da NF
         <input id="movementFiscalNumber" type="text" placeholder="Ex: 000123" value="${formState.fiscalNumber || ""}" />
+      </label>
+
+      <label>
+        Nº certificado fornecedor
+        <input id="movementSupplierCertificateNumber" type="text" placeholder="Ex: CERT-2026-001" value="${formState.supplierCertificateNumber || ""}" />
       </label>
 
       <label>

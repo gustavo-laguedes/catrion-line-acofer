@@ -22,10 +22,106 @@ function normalizeDecimal(value) {
   return Number.isFinite(number) ? number : 0;
 }
 
+function normalizeUnitName(unit) {
+  return String(unit || "").trim().toLowerCase();
+}
+
+function normalizeUnitForComparison(unit) {
+  return normalizeUnitName(unit)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function isManualOrEmptyUnit(unit) {
+  const normalized = normalizeUnitForComparison(unit);
+
+  return (
+    !normalized ||
+    normalized === "-" ||
+    normalized === "manual" ||
+    normalized === "outro" ||
+    normalized.includes("manual") ||
+    normalized.includes("informada operacionalmente") ||
+    normalized.includes("informado na producao")
+  );
+}
+
 function toDateOnly(value) {
   if (!value) return "";
   if (value instanceof Date) return value.toISOString().slice(0, 10);
   return String(value).slice(0, 10);
+}
+
+function getOutputQuantityForConsumedUnit(outputMaterial, consumedUnit, outputLots) {
+  const unit = normalizeUnitForComparison(consumedUnit);
+  const primaryUnit = normalizeUnitForComparison(outputMaterial?.unit || outputMaterial?.primaryUnit || outputMaterial?.primary_unit);
+  const secondaryUnit = normalizeUnitForComparison(outputMaterial?.secondary_unit || outputMaterial?.secondaryUnit);
+
+  if (unit && secondaryUnit && unit === secondaryUnit) {
+    return outputLots.reduce((sum, lot) => sum + normalizeDecimal(lot.secondaryQuantity), 0);
+  }
+
+  if (!unit || unit === primaryUnit) {
+    return outputLots.reduce((sum, lot) => sum + normalizeDecimal(lot.quantity), 0);
+  }
+
+  return null;
+}
+
+function resolveVariableConsumptionExpectedQuantity(outputMaterial, inputUnit, productiveConsumedLots, outputLots) {
+  const unitsToTry = [];
+
+  if (!isManualOrEmptyUnit(inputUnit)) {
+    unitsToTry.push({ source: "model", unit: inputUnit });
+  }
+
+  for (const consumed of productiveConsumedLots) {
+    unitsToTry.push({ source: "consumedLot", unit: consumed.sourceLot.unit });
+    unitsToTry.push({ source: "consumedLotSecondary", unit: consumed.sourceLot.secondary_unit });
+  }
+
+  for (const candidate of unitsToTry) {
+    const expectedQuantity = getOutputQuantityForConsumedUnit(outputMaterial, candidate.unit, outputLots);
+
+    if (expectedQuantity !== null) {
+      return {
+        expectedQuantity,
+        resolvedUnit: candidate.unit,
+        resolvedFrom: candidate.source
+      };
+    }
+  }
+
+  const inputUnitIsManual = isManualOrEmptyUnit(inputUnit);
+  const normalizedInputUnit = normalizeUnitForComparison(inputUnit);
+  const matchesConsumedPrimaryUnit = productiveConsumedLots.some((consumed) => {
+    const consumedPrimaryUnit = normalizeUnitForComparison(consumed.sourceLot.unit);
+    return consumedPrimaryUnit && (inputUnitIsManual || consumedPrimaryUnit === normalizedInputUnit);
+  });
+
+  if (matchesConsumedPrimaryUnit) {
+    return {
+      expectedQuantity: outputLots.reduce((sum, lot) => sum + normalizeDecimal(lot.quantity), 0),
+      resolvedUnit: productiveConsumedLots.find((consumed) => consumed.sourceLot.unit)?.sourceLot.unit || inputUnit,
+      resolvedFrom: "consumedMaterialPrimaryFallback"
+    };
+  }
+
+  return {
+    expectedQuantity: null,
+    resolvedUnit: null,
+    resolvedFrom: null
+  };
+}
+
+function isVariableConsumptionMode(mode) {
+  const normalized = normalizeUnitForComparison(mode);
+
+  return normalized === "variavel na producao";
+}
+
+function isIndustrialLossConsumption(consumed) {
+  return Boolean(consumed?.isIndustrialLoss) || consumed?.eventType === "INDUSTRIAL_LOSS";
 }
 
 async function resolveByIdOrName(client, table, id, name, label) {
@@ -137,12 +233,26 @@ async function getProductionById(client, id) {
         pcl.unit as "inputUnit",
         pcl.secondary_quantity as "secondaryQuantity",
         pcl.secondary_unit as "secondaryUnit",
-        loc.name as "locationName"
+        loc.name as "locationName",
+        coalesce(le.event_type, 'PRODUCTION_CONSUME') as "eventType"
       from production_consumed_lots pcl
       join lots lo on lo.id = pcl.lot_id
       join materials im on im.id = lo.material_id
       left join stock_balances sb on sb.lot_id = lo.id and sb.location_id = $2
       left join locations loc on loc.id = $2
+      left join lateral (
+        select event_type
+        from lot_events
+        where reference_type = 'production'
+          and reference_id = pcl.production_id
+          and lot_id = pcl.lot_id
+          and abs(abs(quantity) - pcl.quantity) < 0.0001
+          and event_type in ('PRODUCTION_CONSUME', 'INDUSTRIAL_LOSS')
+        order by
+          case when event_type = 'INDUSTRIAL_LOSS' then 0 else 1 end,
+          event_date desc
+        limit 1
+      ) le on true
       where pcl.production_id = $1
       order by lo.lot_code asc;
     `,
@@ -212,24 +322,38 @@ function normalizeProductionForClient(production, consumedRows, outputLots, oper
     status: production.status || "Processado",
     createdAt: production.createdAt,
     updatedAt: production.updatedAt,
-    consumedItems: consumedRows.length
-      ? [{
-          id: consumedRows[0].id,
+    consumedItems: Object.values(consumedRows.reduce((groups, row) => {
+      const key = row.inputCode || row.inputMaterial || row.sourceLotId;
+
+      if (!groups[key]) {
+        groups[key] = {
+          id: row.id,
           productionRecordId: production.id,
-          inputMaterial: consumedRows[0].inputMaterial,
-          inputCode: consumedRows[0].inputCode,
-          inputUnit: consumedRows[0].inputUnit,
-          requiredQuantity: normalizeDecimal(consumedRows[0].quantity),
-          consumedLots: consumedRows.map((row) => ({
-            sourceLotId: row.sourceLotId,
-            lotCode: row.lotCode,
-            locationName: row.locationName || production.locationName || "",
-            quantity: normalizeDecimal(row.quantity),
-            secondaryQuantity: normalizeDecimal(row.secondaryQuantity)
-          })),
+          inputMaterial: row.inputMaterial,
+          inputCode: row.inputCode,
+          inputUnit: row.inputUnit,
+          requiredQuantity: 0,
+          consumedLots: [],
           sourceLocation: production.locationName || ""
-        }]
-      : [],
+        };
+      }
+
+      const quantity = normalizeDecimal(row.quantity);
+      groups[key].requiredQuantity += quantity;
+      groups[key].consumedLots.push({
+        sourceLotId: row.sourceLotId,
+        lotId: row.sourceLotId,
+        lotCode: row.lotCode,
+        locationName: row.locationName || production.locationName || "",
+        quantity,
+        secondaryQuantity: normalizeDecimal(row.secondaryQuantity),
+        eventType: row.eventType || "PRODUCTION_CONSUME",
+        type: row.eventType || "PRODUCTION_CONSUME",
+        isIndustrialLoss: row.eventType === "INDUSTRIAL_LOSS"
+      });
+
+      return groups;
+    }, {})),
     producedLots: outputLots.map((lot) => ({
       id: lot.id,
       productionRecordId: production.id,
@@ -749,7 +873,9 @@ async function resolveProductionPayload(client, body) {
   const outputLots = Array.isArray(body.outputLots || body.producedLots)
     ? body.outputLots || body.producedLots
     : [];
-  const consumedLot = body.consumedLot || {};
+  const consumedLotsInput = Array.isArray(body.consumedLots) && body.consumedLots.length
+    ? body.consumedLots
+    : [body.consumedLot || {}];
 
   if (outputLots.length < 1) {
     throw Object.assign(new Error("Informe ao menos um lote produzido."), { status: 400 });
@@ -771,40 +897,83 @@ async function resolveProductionPayload(client, body) {
     [materialId]
   );
   const outputMaterial = materialResult.rows[0];
+  outputMaterial.unit = normalizeText(body.outputUnit) || outputMaterial.unit || "un";
+  outputMaterial.secondary_unit = normalizeText(body.outputSecondaryUnit) || outputMaterial.secondary_unit;
 
-  const consumedLotResult = await client.query(
-    `
-      select
-        lo.id,
-        lo.material_id,
-        lo.lot_code,
-        m.code as material_code,
-        m.name as material_name,
-        coalesce(m.primary_unit, m.unit) as unit,
-        m.secondary_unit,
-        sb.quantity,
-        sb.secondary_quantity
-      from lots lo
-      join materials m on m.id = lo.material_id
-      join stock_balances sb on sb.lot_id = lo.id and sb.location_id = $2
-      where (lo.id = $1 or lo.lot_code = $3)
-      for update of sb, lo;
-    `,
-    [consumedLot.lotId || consumedLot.id || null, locationId, consumedLot.lotCode || null]
-  );
+  const consumedLots = [];
 
-  if (!consumedLotResult.rows.length) {
-    throw Object.assign(new Error("Lote consumido nao encontrado no local selecionado."), { status: 400 });
+  for (const consumedLot of consumedLotsInput) {
+    const consumedLotResult = await client.query(
+      `
+        select
+          lo.id,
+          lo.material_id,
+          lo.lot_code,
+          m.code as material_code,
+          m.name as material_name,
+          coalesce(m.primary_unit, m.unit) as unit,
+          m.secondary_unit,
+          sb.quantity,
+          sb.secondary_quantity
+        from lots lo
+        join materials m on m.id = lo.material_id
+        join stock_balances sb on sb.lot_id = lo.id and sb.location_id = $2
+        where (lo.id = $1 or lo.lot_code = $3)
+        for update of sb, lo;
+      `,
+      [consumedLot.lotId || consumedLot.id || null, locationId, consumedLot.lotCode || null]
+    );
+
+    if (!consumedLotResult.rows.length) {
+      throw Object.assign(new Error("Lote consumido nao encontrado no local selecionado."), { status: 400 });
+    }
+
+    const sourceLot = consumedLotResult.rows[0];
+    const consumedQuantity = normalizeDecimal(consumedLot.quantity ?? consumedLot.consumedQuantity);
+    const consumedSecondaryQuantity = consumedLot.secondaryQuantity === undefined || consumedLot.secondaryQuantity === null
+      ? null
+      : normalizeDecimal(consumedLot.secondaryQuantity);
+
+    if (consumedLot.materialCode && sourceLot.material_code !== consumedLot.materialCode) {
+      throw Object.assign(new Error(`O lote consumido ${sourceLot.lot_code} nao pertence ao material ${consumedLot.materialName || consumedLot.materialCode}.`), { status: 400 });
+    }
+
+    if (consumedQuantity <= 0) {
+      throw Object.assign(new Error("Quantidade consumida deve ser maior que zero."), { status: 400 });
+    }
+
+    if (normalizeDecimal(sourceLot.quantity) + 0.0001 < consumedQuantity) {
+      throw Object.assign(new Error(`A producao informada ultrapassa o saldo disponivel do lote consumido ${sourceLot.lot_code}.`), { status: 409 });
+    }
+
+    consumedLots.push({
+      sourceLot,
+      consumedQuantity,
+      consumedSecondaryQuantity,
+      eventType: consumedLot.eventType || (consumedLot.isIndustrialLoss ? "INDUSTRIAL_LOSS" : "PRODUCTION_CONSUME"),
+      isIndustrialLoss: Boolean(consumedLot.isIndustrialLoss),
+      notes: normalizeText(consumedLot.notes)
+    });
   }
 
-  const sourceLot = consumedLotResult.rows[0];
-  const consumedQuantity = normalizeDecimal(body.consumedQuantity || consumedLot.quantity);
-  const consumedSecondaryQuantity = body.consumedSecondaryQuantity === undefined || body.consumedSecondaryQuantity === null
-    ? null
-    : normalizeDecimal(body.consumedSecondaryQuantity);
+  const consumedQuantityByLot = new Map();
 
-  if (consumedQuantity <= 0) {
-    throw Object.assign(new Error("Quantidade consumida deve ser maior que zero."), { status: 400 });
+  for (const consumed of consumedLots) {
+    const key = consumed.sourceLot.id;
+    const current = consumedQuantityByLot.get(key) || {
+      lotCode: consumed.sourceLot.lot_code,
+      availableQuantity: normalizeDecimal(consumed.sourceLot.quantity),
+      quantity: 0
+    };
+
+    current.quantity += normalizeDecimal(consumed.consumedQuantity);
+    consumedQuantityByLot.set(key, current);
+  }
+
+  for (const total of consumedQuantityByLot.values()) {
+    if (total.availableQuantity + 0.0001 < total.quantity) {
+      throw Object.assign(new Error(`A produção informada ultrapassa o saldo disponível do lote consumido ${total.lotCode}.`), { status: 409 });
+    }
   }
 
   const normalizedOutputLots = outputLots.map((lot) => ({
@@ -828,16 +997,14 @@ async function resolveProductionPayload(client, body) {
     throw Object.assign(new Error("Cada lote produzido precisa de codigo e quantidade maior que zero."), { status: 400 });
   }
 
+  await validateVariableModelConsumption(client, productionModelId, outputMaterial, normalizedOutputLots, consumedLots);
+
   const existingLots = await client.query("select id, lot_code from lots where lot_code = any($1)", [outputLotCodes]);
   const retainedLotIds = new Set(normalizedOutputLots.map((lot) => lot.lotId || lot.id).filter(Boolean));
   const conflictingLot = existingLots.rows.find((lot) => !retainedLotIds.has(lot.id));
 
   if (conflictingLot) {
     throw Object.assign(new Error(`Lote produzido ${conflictingLot.lot_code} ja existe.`), { status: 409 });
-  }
-
-  if (normalizeDecimal(sourceLot.quantity) + 0.0001 < consumedQuantity) {
-    throw Object.assign(new Error("A producao informada ultrapassa o saldo disponivel do lote consumido."), { status: 409 });
   }
 
   return {
@@ -847,50 +1014,130 @@ async function resolveProductionPayload(client, body) {
     productionModelId,
     operatorIds,
     outputMaterial,
-    sourceLot,
-    consumedQuantity,
-    consumedSecondaryQuantity,
+    sourceLot: consumedLots[0]?.sourceLot || null,
+    consumedQuantity: consumedLots[0]?.consumedQuantity || 0,
+    consumedSecondaryQuantity: consumedLots[0]?.consumedSecondaryQuantity ?? null,
+    consumedLots,
     outputLots: normalizedOutputLots,
     productionDate: body.productionDate || new Date().toISOString().slice(0, 10),
     notes: normalizeText(body.notes || body.observation)
   };
 }
 
-async function insertProductionDetails(client, productionId, payload, applyStock = true) {
-  await client.query(
+async function validateVariableModelConsumption(client, productionModelId, outputMaterial, outputLots, consumedLots) {
+  const result = await client.query(
     `
-      insert into production_consumed_lots (
-        production_id,
-        lot_id,
-        quantity,
+      select
+        input_material_id as "inputMaterialId",
         unit,
-        secondary_quantity,
-        secondary_unit
-      )
-      values ($1, $2, $3, $4, $5, $6);
+        coalesce(consumption_mode, 'Fixo') as "consumptionMode"
+      from material_production_model_inputs
+      where production_model_id = $1;
     `,
-    [productionId, payload.sourceLot.id, payload.consumedQuantity, payload.sourceLot.unit || "un", payload.consumedSecondaryQuantity, payload.sourceLot.secondary_unit]
+    [productionModelId]
   );
 
-  if (applyStock) {
-    await applyBalanceDelta(client, {
-      lotId: payload.sourceLot.id,
-      materialId: payload.sourceLot.material_id,
-      locationId: payload.locationId,
-      quantity: payload.consumedQuantity,
-      secondaryQuantity: payload.consumedSecondaryQuantity,
-      unit: payload.sourceLot.unit || "un",
-      secondaryUnit: payload.sourceLot.secondary_unit
-    }, -1);
+  for (const input of result.rows.filter((row) => isVariableConsumptionMode(row.consumptionMode))) {
+    const productiveConsumedLots = consumedLots.filter((consumed) => {
+      return (
+        String(consumed.sourceLot.material_id) === String(input.inputMaterialId) &&
+        !isIndustrialLossConsumption(consumed)
+      );
+    });
 
-    await writeProductionLotEvent(client, {
-      lotId: payload.sourceLot.id,
-      locationId: payload.locationId,
-      quantity: payload.consumedQuantity,
-      secondaryQuantity: payload.consumedSecondaryQuantity,
-      unit: payload.sourceLot.unit || "un",
-      secondaryUnit: payload.sourceLot.secondary_unit
-    }, productionId, -1, "PRODUCTION_CONSUME", "Baixa por producao");
+    if (!productiveConsumedLots.length) {
+      continue;
+    }
+
+    const variableValidationContext = {
+      productionModelId,
+      inputMaterialId: input.inputMaterialId,
+      outputMaterialUnit: outputMaterial?.unit || null,
+      outputMaterialSecondaryUnit: outputMaterial?.secondary_unit || null,
+      inputUnit: input.unit || null,
+      consumedLots: productiveConsumedLots.map((consumed) => ({
+        lotCode: consumed.sourceLot.lot_code,
+        materialCode: consumed.sourceLot.material_code,
+        materialName: consumed.sourceLot.material_name,
+        materialUnit: consumed.sourceLot.unit,
+        materialSecondaryUnit: consumed.sourceLot.secondary_unit,
+        quantity: normalizeDecimal(consumed.consumedQuantity),
+        secondaryQuantity: consumed.consumedSecondaryQuantity,
+        eventType: consumed.eventType
+      })),
+      outputLots: outputLots.map((lot) => ({
+        lotCode: lot.lotCode,
+        quantity: normalizeDecimal(lot.quantity),
+        secondaryQuantity: lot.secondaryQuantity
+      }))
+    };
+
+    const {
+      expectedQuantity,
+      resolvedUnit,
+      resolvedFrom
+    } = resolveVariableConsumptionExpectedQuantity(outputMaterial, input.unit, productiveConsumedLots, outputLots);
+
+    if (expectedQuantity === null) {
+      console.error("Validacao de consumo variavel sem unidade resolvida:", variableValidationContext);
+      throw Object.assign(new Error("Unidade de consumo variavel nao resolvida para o modelo de producao. Verifique no console do servidor a unidade do modelo, a unidade do insumo consumido e as unidades principal/secundaria do material produzido."), { status: 400 });
+    }
+
+    const informedQuantity = productiveConsumedLots
+      .reduce((sum, consumed) => sum + normalizeDecimal(consumed.consumedQuantity), 0);
+
+    console.info("Validacao de consumo variavel:", {
+      ...variableValidationContext,
+      resolvedUnit,
+      resolvedFrom,
+      expectedQuantity,
+      informedQuantity
+    });
+
+    if (Math.abs(informedQuantity - expectedQuantity) > 0.0001) {
+      throw Object.assign(new Error("Quantidade consumida variável diverge da quantidade produzida na unidade correspondente."), { status: 400 });
+    }
+  }
+}
+
+async function insertProductionDetails(client, productionId, payload, applyStock = true) {
+  for (const consumed of payload.consumedLots) {
+    await client.query(
+      `
+        insert into production_consumed_lots (
+          production_id,
+          lot_id,
+          quantity,
+          unit,
+          secondary_quantity,
+          secondary_unit
+        )
+        values ($1, $2, $3, $4, $5, $6);
+      `,
+      [productionId, consumed.sourceLot.id, consumed.consumedQuantity, consumed.sourceLot.unit || "un", consumed.consumedSecondaryQuantity, consumed.sourceLot.secondary_unit]
+    );
+
+    if (applyStock) {
+      const impact = {
+        lotId: consumed.sourceLot.id,
+        materialId: consumed.sourceLot.material_id,
+        locationId: payload.locationId,
+        quantity: consumed.consumedQuantity,
+        secondaryQuantity: consumed.consumedSecondaryQuantity,
+        unit: consumed.sourceLot.unit || "un",
+        secondaryUnit: consumed.sourceLot.secondary_unit
+      };
+
+      await applyBalanceDelta(client, impact, -1);
+      await writeProductionLotEvent(
+        client,
+        impact,
+        productionId,
+        -1,
+        consumed.eventType || "PRODUCTION_CONSUME",
+        consumed.notes || (consumed.isIndustrialLoss ? "Perda industrial por saldo remanescente de produção" : "Baixa por produção")
+      );
+    }
   }
 
   for (const operatorId of payload.operatorIds) {
@@ -936,22 +1183,24 @@ async function insertProductionDetails(client, productionId, payload, applyStock
       [productionId, outputLotId, lot.lotCode, lot.quantity, payload.outputMaterial.unit || "un", lot.secondaryQuantity, payload.outputMaterial.secondary_unit]
     );
 
-    await client.query(
-      `
-        insert into lot_links (
-          parent_lot_id,
-          child_lot_id,
-          production_id,
-          link_type
-        )
-        values ($1, $2, $3, 'TRANSFORMATION')
-        on conflict do nothing;
-      `,
-      [payload.sourceLot.id, outputLotId, productionId]
-    );
+    for (const consumed of payload.consumedLots) {
+      await client.query(
+        `
+          insert into lot_links (
+            parent_lot_id,
+            child_lot_id,
+            production_id,
+            link_type
+          )
+          values ($1, $2, $3, 'TRANSFORMATION')
+          on conflict do nothing;
+        `,
+        [consumed.sourceLot.id, outputLotId, productionId]
+      );
+    }
 
     if (lotIsActive) {
-      await applyBalanceDelta(client, {
+      const outputImpact = {
         lotId: outputLotId,
         materialId: payload.materialId,
         locationId: payload.locationId,
@@ -959,20 +1208,16 @@ async function insertProductionDetails(client, productionId, payload, applyStock
         secondaryQuantity: lot.secondaryQuantity,
         unit: payload.outputMaterial.unit || "un",
         secondaryUnit: payload.outputMaterial.secondary_unit
-      }, 1);
+      };
 
-      await writeProductionLotEvent(client, {
-        lotId: outputLotId,
-        locationId: payload.locationId,
-        quantity: lot.quantity,
-        secondaryQuantity: lot.secondaryQuantity,
-        unit: payload.outputMaterial.unit || "un",
-        secondaryUnit: payload.outputMaterial.secondary_unit
-      }, productionId, 1, "PRODUCTION_OUTPUT", "Entrada por producao");
+      await applyBalanceDelta(client, outputImpact, 1);
+      await writeProductionLotEvent(client, outputImpact, productionId, 1, "PRODUCTION_OUTPUT", "Entrada por producao");
     }
   }
 
-  await refreshLotStatus(client, payload.sourceLot.id);
+  for (const consumed of payload.consumedLots) {
+    await refreshLotStatus(client, consumed.sourceLot.id);
+  }
 }
 
 async function changeProductionStatus(req, res, nextStatus, action) {
@@ -1101,7 +1346,7 @@ router.put("/:id", async (req, res) => {
         payload.productionModelId,
         payload.machineId,
         payload.locationId,
-        payload.sourceLot.id,
+        payload.sourceLot?.id || null,
         payload.notes,
         req.params.id
       ]
@@ -1142,93 +1387,12 @@ router.post("/:productionId/output-lots/:outputLotId/reprocess", async (req, res
 });
 
 router.post("/", async (req, res) => {
-  const body = req.body || {};
-  const outputLots = Array.isArray(body.outputLots || body.producedLots)
-    ? body.outputLots || body.producedLots
-    : [];
-  const consumedLot = body.consumedLot || {};
-
   const client = await pool.connect();
 
   try {
-    if (outputLots.length < 1) {
-      return res.status(400).json({ error: "Informe ao menos um lote produzido." });
-    }
-
     await client.query("begin");
 
-    const materialId = await resolveByIdOrName(client, "materials", body.materialId || body.outputMaterialId, body.outputMaterialName, "Material produzido");
-    const locationId = await resolveByIdOrName(client, "locations", body.locationId, body.locationName, "Local");
-    const machineId = await resolveByIdOrName(client, "machines", body.machineId, body.machineName, "Maquina");
-    const productionModelId = await resolveProductionModel(client, materialId, body.productionModelId, body.productionModelName);
-    const operatorIds = await resolveOperators(client, body.operatorIds || [], body.operatorCodes || body.responsibleCodes || []);
-
-    const materialResult = await client.query(
-      `
-        select id, code, name, coalesce(primary_unit, unit) as unit, secondary_unit
-        from materials
-        where id = $1
-        limit 1;
-      `,
-      [materialId]
-    );
-    const outputMaterial = materialResult.rows[0];
-
-    const consumedLotResult = await client.query(
-      `
-        select
-          lo.id,
-          lo.material_id,
-          lo.lot_code,
-          m.code as material_code,
-          m.name as material_name,
-          coalesce(m.primary_unit, m.unit) as unit,
-          m.secondary_unit,
-          sb.quantity,
-          sb.secondary_quantity
-        from lots lo
-        join materials m on m.id = lo.material_id
-        join stock_balances sb on sb.lot_id = lo.id and sb.location_id = $2
-        where (lo.id = $1 or lo.lot_code = $3)
-        for update of sb, lo;
-      `,
-      [consumedLot.lotId || consumedLot.id || null, locationId, consumedLot.lotCode || null]
-    );
-
-    if (!consumedLotResult.rows.length) {
-      throw Object.assign(new Error("Lote consumido nao encontrado no local selecionado."), { status: 400 });
-    }
-
-    const sourceLot = consumedLotResult.rows[0];
-    const consumedQuantity = normalizeDecimal(body.consumedQuantity || consumedLot.quantity);
-    const consumedSecondaryQuantity = body.consumedSecondaryQuantity === undefined || body.consumedSecondaryQuantity === null
-      ? null
-      : normalizeDecimal(body.consumedSecondaryQuantity);
-
-    if (consumedQuantity <= 0) {
-      throw Object.assign(new Error("Quantidade consumida deve ser maior que zero."), { status: 400 });
-    }
-
-    if (normalizeDecimal(sourceLot.quantity) + 0.0001 < consumedQuantity) {
-      throw Object.assign(new Error("A producao informada ultrapassa o saldo disponivel do lote consumido."), { status: 409 });
-    }
-
-    const duplicateLotCodes = outputLots
-      .map((lot) => normalizeText(lot.lotCode)?.toUpperCase())
-      .filter(Boolean);
-
-    if (duplicateLotCodes.length !== new Set(duplicateLotCodes).size) {
-      throw Object.assign(new Error("Existe duplicidade de lote produzido nesta producao."), { status: 400 });
-    }
-
-    const existingLots = await client.query(
-      "select lot_code from lots where lot_code = any($1)",
-      [duplicateLotCodes]
-    );
-
-    if (existingLots.rows.length) {
-      throw Object.assign(new Error(`Lote produzido ${existingLots.rows[0].lot_code} ja existe.`), { status: 409 });
-    }
+    const payload = await resolveProductionPayload(client, req.body || {});
 
     const productionResult = await client.query(
       `
@@ -1246,173 +1410,18 @@ router.post("/", async (req, res) => {
         returning id;
       `,
       [
-        body.productionDate || new Date().toISOString().slice(0, 10),
-        materialId,
-        productionModelId,
-        machineId,
-        locationId,
-        sourceLot.id,
-        normalizeText(body.notes || body.observation)
+        payload.productionDate,
+        payload.materialId,
+        payload.productionModelId,
+        payload.machineId,
+        payload.locationId,
+        payload.sourceLot?.id || null,
+        payload.notes
       ]
     );
     const productionId = productionResult.rows[0].id;
 
-    await client.query(
-      `
-        insert into production_consumed_lots (
-          production_id,
-          lot_id,
-          quantity,
-          unit,
-          secondary_quantity,
-          secondary_unit
-        )
-        values ($1, $2, $3, $4, $5, $6);
-      `,
-      [productionId, sourceLot.id, consumedQuantity, sourceLot.unit || "un", consumedSecondaryQuantity, sourceLot.secondary_unit]
-    );
-
-    await client.query(
-      `
-        update stock_balances
-        set
-          quantity = quantity - $3,
-          secondary_quantity = case
-            when secondary_quantity is null and $4::numeric is null then null
-            else coalesce(secondary_quantity, 0) - coalesce($4::numeric, 0)
-          end,
-          status = case when quantity - $3 > 0 then 'Disponível' else 'Sem saldo' end,
-          updated_at = now()
-        where lot_id = $1 and location_id = $2;
-      `,
-      [sourceLot.id, locationId, consumedQuantity, consumedSecondaryQuantity]
-    );
-
-    await client.query(
-      `
-        insert into lot_events (
-          lot_id,
-          event_type,
-          event_date,
-          reference_type,
-          reference_id,
-          location_id,
-          quantity,
-          secondary_quantity,
-          unit,
-          secondary_unit,
-          notes
-        )
-        values ($1, 'PRODUCTION_CONSUME', now(), 'production', $2, $3, $4, $5, $6, $7, $8);
-      `,
-      [sourceLot.id, productionId, locationId, consumedQuantity * -1, consumedSecondaryQuantity === null ? null : consumedSecondaryQuantity * -1, sourceLot.unit || "un", sourceLot.secondary_unit, "Baixa por producao"]
-    );
-
-    for (const operatorId of operatorIds) {
-      await client.query(
-        "insert into production_operators (production_id, operator_id) values ($1, $2) on conflict do nothing",
-        [productionId, operatorId]
-      );
-    }
-
-    for (const lot of outputLots) {
-      const lotCode = normalizeText(lot.lotCode)?.toUpperCase();
-      const quantity = normalizeDecimal(lot.quantity ?? lot.outputQuantity);
-      const secondaryQuantity = lot.secondaryQuantity === undefined || lot.secondaryQuantity === null || lot.secondaryQuantity === ""
-        ? null
-        : normalizeDecimal(lot.secondaryQuantity ?? lot.outputSecondaryQuantity);
-
-      if (!lotCode || quantity <= 0) {
-        throw Object.assign(new Error("Cada lote produzido precisa de codigo e quantidade maior que zero."), { status: 400 });
-      }
-
-      const createdLot = await client.query(
-        `
-          insert into lots (
-            lot_code,
-            material_id,
-            origin_type,
-            origin_id,
-            production_date,
-            current_location_id,
-            status
-          )
-          values ($1, $2, 'PRODUCTION', $3, $4::date, $5, 'Disponível')
-          returning id;
-        `,
-        [lotCode, materialId, productionId, body.productionDate || new Date().toISOString().slice(0, 10), locationId]
-      );
-      const outputLotId = createdLot.rows[0].id;
-
-      await client.query(
-        `
-          insert into production_output_lots (
-            production_id,
-            lot_id,
-            lot_code,
-            quantity,
-            unit,
-            secondary_quantity,
-            secondary_unit
-          )
-          values ($1, $2, $3, $4, $5, $6, $7);
-        `,
-        [productionId, outputLotId, lotCode, quantity, outputMaterial.unit || "un", secondaryQuantity, outputMaterial.secondary_unit]
-      );
-
-      await client.query(
-        `
-          insert into stock_balances (
-            lot_id,
-            material_id,
-            location_id,
-            quantity,
-            secondary_quantity,
-            unit,
-            secondary_unit,
-            status
-          )
-          values ($1, $2, $3, $4, $5, $6, $7, 'Disponível');
-        `,
-        [outputLotId, materialId, locationId, quantity, secondaryQuantity, outputMaterial.unit || "un", outputMaterial.secondary_unit]
-      );
-
-      await client.query(
-        `
-          insert into lot_links (
-            parent_lot_id,
-            child_lot_id,
-            production_id,
-            link_type
-          )
-          values ($1, $2, $3, 'TRANSFORMATION')
-          on conflict do nothing;
-        `,
-        [sourceLot.id, outputLotId, productionId]
-      );
-
-      await client.query(
-        `
-          insert into lot_events (
-            lot_id,
-            event_type,
-            event_date,
-            reference_type,
-            reference_id,
-            location_id,
-            quantity,
-            secondary_quantity,
-            unit,
-            secondary_unit,
-            notes
-          )
-          values ($1, 'PRODUCTION_OUTPUT', now(), 'production', $2, $3, $4, $5, $6, $7, $8);
-        `,
-        [outputLotId, productionId, locationId, quantity, secondaryQuantity, outputMaterial.unit || "un", outputMaterial.secondary_unit, "Entrada por producao"]
-      );
-    }
-
-    await refreshLotStatus(client, sourceLot.id);
+    await insertProductionDetails(client, productionId, payload, true);
 
     const production = await getProductionById(client, productionId);
     await client.query("commit");

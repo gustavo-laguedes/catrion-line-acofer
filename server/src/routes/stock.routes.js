@@ -50,6 +50,111 @@ function createEmptyGroup(material) {
   };
 }
 
+router.get("/available-lots", async (req, res) => {
+  try {
+    const materialId = String(req.query.materialId || "").trim();
+    const materialName = String(req.query.materialName || "").trim();
+    const originLocationId = String(req.query.originLocationId || req.query.locationId || "").trim();
+    const originLocationName = String(req.query.originLocationName || req.query.locationName || "").trim();
+
+    if (!materialId && !materialName) {
+      return res.status(400).json({ error: "Informe o material para consultar lotes disponiveis." });
+    }
+
+    if (!originLocationId && !originLocationName) {
+      return res.status(400).json({ error: "Informe o local de origem para consultar lotes disponiveis." });
+    }
+
+    const filters = [
+      "m.status = 'Ativo'",
+      "sb.quantity > 0",
+      "(coalesce(lots.status, 'Disponivel') in ('Disponivel', 'Disponível', 'Ativo'))",
+      "(sb.status is null or sb.status in ('Disponivel', 'Disponível', 'Ativo'))"
+    ];
+    const values = [];
+
+    if (materialId) {
+      values.push(materialId);
+      filters.push(`m.id = $${values.length}`);
+    } else {
+      values.push(materialName);
+      filters.push(`m.name = $${values.length}`);
+    }
+
+    if (originLocationId) {
+      values.push(originLocationId);
+      filters.push(`loc.id = $${values.length}`);
+    } else {
+      values.push(originLocationName);
+      filters.push(`loc.name = $${values.length}`);
+    }
+
+    const result = await query(
+      `
+        select
+          sb.id as "balanceId",
+          sb.material_id as "materialId",
+          m.code as "materialCode",
+          m.name as "materialName",
+          coalesce(m.unit, sb.unit) as "materialUnit",
+          m.secondary_unit as "materialSecondaryUnit",
+          sb.location_id as "locationId",
+          loc.name as "locationName",
+          sb.lot_id as "lotId",
+          lots.lot_code as "lotCode",
+          lots.production_date as "productionDate",
+          lots.created_at as "createdAt",
+          lots.status as "lotStatus",
+          sb.quantity,
+          sb.secondary_quantity as "secondaryQuantity",
+          sb.unit,
+          sb.secondary_unit as "secondaryUnit",
+          sb.status as "balanceStatus",
+          sb.updated_at as "updatedAt"
+        from stock_balances sb
+        join materials m on m.id = sb.material_id
+        join locations loc on loc.id = sb.location_id
+        join lots on lots.id = sb.lot_id
+        where ${filters.join("\n          and ")}
+        order by lots.production_date asc nulls last, lots.created_at asc nulls last, lots.lot_code asc;
+      `,
+      values
+    );
+
+    return res.json(result.rows.map((lot) => {
+      const quantity = toNumber(lot.quantity);
+      const secondaryQuantity = toNumber(lot.secondaryQuantity);
+
+      return {
+        id: lot.lotId,
+        sourceLotId: lot.lotId,
+        lotId: lot.lotId,
+        balanceId: lot.balanceId,
+        materialId: lot.materialId,
+        materialCode: lot.materialCode,
+        materialName: lot.materialName,
+        locationId: lot.locationId,
+        locationName: lot.locationName,
+        lotCode: lot.lotCode,
+        productionDate: lot.productionDate,
+        createdAt: lot.createdAt,
+        quantity,
+        secondaryQuantity,
+        reservedQuantity: 0,
+        availableQuantity: quantity,
+        availableSecondaryQuantity: secondaryQuantity,
+        unit: lot.unit || lot.materialUnit || "-",
+        secondaryUnit: lot.secondaryUnit || lot.materialSecondaryUnit || "",
+        status: lot.lotStatus || lot.balanceStatus || "Disponivel",
+        updatedAt: lot.updatedAt
+      };
+    }));
+  } catch (error) {
+    console.error("Erro ao consultar lotes disponiveis:", error);
+    return res.status(500).json(INTERNAL_ERROR);
+  }
+});
+
 router.get("/", async (req, res) => {
   try {
     const materialsResult = await query(`
@@ -58,9 +163,9 @@ router.get("/", async (req, res) => {
         m.code,
         m.name,
         mt.name as "materialType",
-        coalesce(m.primary_unit, m.unit) as unit,
+        m.unit,
         m.secondary_unit as "secondaryUnit",
-        coalesce(m.minimum_stock_quantity, m.min_stock, 0) as "minStock",
+        coalesce(m.min_stock, 0) as "minStock",
         coalesce(
           json_agg(distinct l.name) filter (where l.id is not null),
           '[]'
@@ -81,9 +186,9 @@ router.get("/", async (req, res) => {
         m.code as "materialCode",
         m.name as "materialName",
         mt.name as "materialType",
-        coalesce(m.primary_unit, m.unit, sb.unit) as "materialUnit",
+        coalesce(m.unit, sb.unit) as "materialUnit",
         m.secondary_unit as "materialSecondaryUnit",
-        coalesce(m.minimum_stock_quantity, m.min_stock, 0) as "minStock",
+        coalesce(m.min_stock, 0) as "minStock",
         sb.location_id as "locationId",
         loc.name as "locationName",
         sb.lot_id as "lotId",
@@ -105,6 +210,8 @@ router.get("/", async (req, res) => {
       join lots on lots.id = sb.lot_id
       where m.status = 'Ativo'
         and sb.quantity > 0
+        and coalesce(lots.status, 'Disponivel') in ('Disponivel', 'Disponível', 'Ativo')
+        and coalesce(sb.status, 'Disponivel') in ('Disponivel', 'Disponível', 'Ativo')
       order by m.name asc, loc.name asc, lots.lot_code asc;
     `);
 

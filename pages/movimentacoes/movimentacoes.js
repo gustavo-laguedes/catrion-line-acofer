@@ -16,9 +16,11 @@ import {
   toDateTimeInputValue,
   getMaterialSecondaryData,
   calculateFixedSecondaryQuantity,
+  calculateProportionalLotSecondaryQuantity,
   applyLotSecondaryQuantity,
+  applyProportionalLotSecondaryQuantity,
   renderLotSecondaryField
-} from "./movimentacoes-utils.js";
+} from "./movimentacoes-utils.js?v=expedition-api";
 
 import {
   createPurchaseFormState,
@@ -745,6 +747,13 @@ function renderMovementReadOnly(movement, items) {
         </div>
       ` : ""}
 
+      ${movement.type === "PURCHASE" ? `
+        <div>
+          <small>Certificado fornecedor</small>
+          <strong>${movement.supplierCertificateNumber || "-"}</strong>
+        </div>
+      ` : ""}
+
       ${!isSale ? `
         <div>
           <small>Anexo</small>
@@ -834,6 +843,11 @@ value="${movement.type === "PURCHASE" || movement.type === "SALE" || movement.ty
   <label>
     Número da NF
     <input id="editMovementFiscalNumber" type="text" value="${movement.fiscalNumber || ""}" />
+  </label>
+
+  <label>
+    Nº certificado fornecedor
+    <input id="editMovementSupplierCertificateNumber" type="text" value="${movement.supplierCertificateNumber || ""}" />
   </label>
 
   <label>
@@ -1253,6 +1267,13 @@ document.getElementById("movementLocation")?.addEventListener("change", () => {
 
   document.getElementById("addMovementItemBtn")?.addEventListener("click", addDraftItem);
 
+  document.getElementById("movementOriginLocation")?.addEventListener("change", async () => {
+    if (activeMovementTab !== "TRANSFER") return;
+
+    captureMovementFormState();
+    await refreshTransferDraftLotsForOrigin();
+  });
+
   document.querySelectorAll(".remove-movement-item-btn").forEach((button) => {
     button.addEventListener("click", () => {
       const index = Number(button.dataset.index);
@@ -1492,10 +1513,16 @@ document.querySelectorAll(".sale-lot-selected").forEach((input) => {
 
     if (lot.selected && lot.exitMode === "TOTAL") {
       lot.exitQuantity = lot.availableQuantity;
-      lot.secondaryQuantity = lot.availableSecondaryQuantity ?? lot.secondaryQuantity ?? "";
+      lot.secondaryQuantity = activeMovementTab === "TRANSFER"
+        ? calculateProportionalLotSecondaryQuantity(lot, lot.exitQuantity)
+        : lot.availableSecondaryQuantity ?? lot.secondaryQuantity ?? "";
     }
 
-    applyLotSecondaryQuantity(item, lot, lot.exitQuantity);
+    if (activeMovementTab === "TRANSFER") {
+      applyProportionalLotSecondaryQuantity(item, lot, lot.exitQuantity);
+    } else {
+      applyLotSecondaryQuantity(item, lot, lot.exitQuantity);
+    }
 
     refreshMovimentacoesPage();
   });
@@ -1512,10 +1539,16 @@ document.querySelectorAll(".sale-lot-mode").forEach((input) => {
     lot.exitMode = input.value;
     lot.exitQuantity = input.value === "TOTAL" ? lot.availableQuantity : 0;
     lot.secondaryQuantity =
-      input.value === "TOTAL" && item.secondaryUnitMode === "manual"
+      activeMovementTab === "TRANSFER"
+        ? calculateProportionalLotSecondaryQuantity(lot, lot.exitQuantity)
+        : input.value === "TOTAL" && item.secondaryUnitMode === "manual"
         ? lot.availableSecondaryQuantity ?? lot.secondaryQuantity ?? ""
         : lot.secondaryQuantity;
-    applyLotSecondaryQuantity(item, lot, lot.exitQuantity);
+    if (activeMovementTab === "TRANSFER") {
+      applyProportionalLotSecondaryQuantity(item, lot, lot.exitQuantity);
+    } else {
+      applyLotSecondaryQuantity(item, lot, lot.exitQuantity);
+    }
 
     refreshMovimentacoesPage();
   });
@@ -1534,7 +1567,11 @@ document.querySelectorAll(".sale-lot-quantity").forEach((input) => {
     lot.selected = true;
     lot.exitMode = "PARTIAL";
     lot.exitQuantity = Number(input.value || 0);
-    applyLotSecondaryQuantity(item, lot, lot.exitQuantity);
+    if (activeMovementTab === "TRANSFER") {
+      applyProportionalLotSecondaryQuantity(item, lot, lot.exitQuantity);
+    } else {
+      applyLotSecondaryQuantity(item, lot, lot.exitQuantity);
+    }
     syncRenderedSecondaryQuantity(input, item, lot, lot.exitQuantity, ".sale-lot-secondary-quantity");
 
     const lotsBox = input.closest(".purchase-lots-box");
@@ -1553,7 +1590,7 @@ document.querySelectorAll(".sale-lot-secondary-quantity").forEach((input) => {
     const item = movementDraftItems[Number(input.dataset.index)];
     const lot = item?.lots?.[Number(input.dataset.lotIndex)];
 
-    if (!lot || item?.secondaryUnitMode === "fixed") return;
+    if (!lot || item?.secondaryUnitMode === "fixed" || activeMovementTab === "TRANSFER") return;
 
     lot.selected = true;
     lot.secondaryQuantity = Number(input.value || 0);
@@ -1588,7 +1625,11 @@ document.querySelectorAll(".sale-lot-picker-check").forEach((input) => {
       lot.secondaryQuantity = "";
     }
 
-    applyLotSecondaryQuantity(item, lot, lot.exitQuantity);
+    if (activeMovementTab === "TRANSFER") {
+      applyProportionalLotSecondaryQuantity(item, lot, lot.exitQuantity);
+    } else {
+      applyLotSecondaryQuantity(item, lot, lot.exitQuantity);
+    }
   });
 });
 
@@ -1741,12 +1782,17 @@ if (placeholder) {
 }
 
 function syncRenderedSecondaryQuantity(input, item, lot, primaryQuantity, selector) {
-  if (!item?.secondaryUnit || item.secondaryUnitMode !== "fixed" || !lot) return;
+  if (!item?.secondaryUnit || !lot) return;
+
+  const shouldSync = item.secondaryUnitMode === "fixed" || activeMovementTab === "TRANSFER";
+  if (!shouldSync) return;
 
   const secondaryInput = input.closest(".purchase-lot-row, .sale-lot-card")?.querySelector(selector);
 
   if (secondaryInput) {
-    secondaryInput.value = calculateFixedSecondaryQuantity(item, primaryQuantity);
+    secondaryInput.value = activeMovementTab === "TRANSFER"
+      ? calculateProportionalLotSecondaryQuantity(lot, primaryQuantity)
+      : calculateFixedSecondaryQuantity(item, primaryQuantity);
   }
 }
 
@@ -1781,7 +1827,7 @@ if (activeMovementTab === "TRANSFER") {
     date: document.getElementById("movementDate")?.value || transferFormState.date || getToday(),
     originLocation: document.getElementById("movementOriginLocation")?.value || transferFormState.originLocation || "",
     destinationLocation: document.getElementById("movementDestinationLocation")?.value || transferFormState.destinationLocation || "",
-    stockExitMode: document.getElementById("movementStockExitMode")?.value || transferFormState.stockExitMode || "FIFO",
+    stockExitMode: document.getElementById("movementStockExitMode")?.value || transferFormState.stockExitMode || "LOT",
     fiscalNumber: document.getElementById("movementFiscalNumber")?.value || transferFormState.fiscalNumber || "",
     observation: document.getElementById("movementObservation")?.value || transferFormState.observation || ""
   };
@@ -1814,11 +1860,12 @@ if (activeMovementTab === "INVENTORY") {
     supplierName: document.getElementById("movementSupplier")?.value || movementFormState.supplierName || "",
     locationName: document.getElementById("movementLocation")?.value || movementFormState.locationName || "",
     fiscalNumber: document.getElementById("movementFiscalNumber")?.value || movementFormState.fiscalNumber || "",
+    supplierCertificateNumber: document.getElementById("movementSupplierCertificateNumber")?.value || movementFormState.supplierCertificateNumber || "",
     observation: document.getElementById("movementObservation")?.value || movementFormState.observation || ""
   };
 }
 
-function addDraftItem() {
+async function addDraftItem() {
 captureMovementFormState();
 
   const materialName = document.getElementById("movementMaterial")?.value;
@@ -1849,7 +1896,7 @@ captureMovementFormState();
       : activeMovementTab === "RETURN"
         ? getAvailableLotsForReturn(materialName, quantity)
         : activeMovementTab === "TRANSFER"
-          ? getAvailableLotsForTransfer(materialName, quantity)
+          ? await getAvailableLotsForTransfer(materialName, quantity, material)
           : activeMovementTab === "ADJUSTMENT"
             ? getAvailableLotsForAdjustment(materialName)
             : activeMovementTab === "INVENTORY"
@@ -1876,7 +1923,11 @@ captureMovementFormState();
             ? lot.countedQuantity
             : lot.quantity;
 
-    applyLotSecondaryQuantity(draftItem, lot, primaryQuantity);
+    if (activeMovementTab === "TRANSFER") {
+      applyProportionalLotSecondaryQuantity(draftItem, lot, primaryQuantity);
+    } else {
+      applyLotSecondaryQuantity(draftItem, lot, primaryQuantity);
+    }
   });
 
   movementDraftItems.push(draftItem);
@@ -1884,14 +1935,28 @@ captureMovementFormState();
   refreshMovimentacoesPage();
 }
 
-function validateSaleLots(items) {
+function validateSaleLots(items, type = "SALE") {
   for (const item of items) {
     if (!item.lots?.length) {
       return {
         valid: false,
         title: "Lotes não encontrados",
-        message: `Nenhum lote disponível para o material ${item.materialName}.`
+        message: type === "TRANSFER"
+          ? `Nenhum lote disponível para o material ${item.materialName} no local de origem informado.`
+          : `Nenhum lote disponível para o material ${item.materialName}.`
       };
+    }
+
+    if (type === "TRANSFER" && transferFormState.stockExitMode === "FIFO") {
+      const availableTotal = item.lots.reduce((sum, lot) => sum + Number(lot.availableQuantity || 0), 0);
+
+      if (availableTotal + 0.0001 < Number(item.quantity || 0)) {
+        return {
+          valid: false,
+          title: "Saldo insuficiente no local de origem",
+          message: `O material ${item.materialName} tem ${formatNumber(availableTotal)} ${item.unit} disponível no local de origem, abaixo da quantidade solicitada.`
+        };
+      }
     }
 
     for (const lot of item.lots) {
@@ -1903,6 +1968,19 @@ function validateSaleLots(items) {
       title: "Quantidade maior que disponível",
       message: `O lote ${lot.lotCode} do material ${item.materialName} não possui saldo suficiente para esta baixa.`
     };
+  }
+
+  if (type === "TRANSFER" && item.secondaryUnit) {
+    const expectedSecondaryQuantity = calculateProportionalLotSecondaryQuantity(lot, lot.exitQuantity);
+    const actualSecondaryQuantity = Number(lot.secondaryQuantity || 0);
+
+    if (Math.abs(actualSecondaryQuantity - expectedSecondaryQuantity) > 0.0001) {
+      return {
+        valid: false,
+        title: "Quantidade secundária inconsistente",
+        message: `A quantidade secundária do lote ${lot.lotCode} precisa seguir a proporção real do saldo disponível.`
+      };
+    }
   }
 }
 
@@ -1954,6 +2032,18 @@ function validateManualSecondaryLots(items, type) {
   return { valid: true };
 }
 
+function syncTransferSecondaryQuantities(items) {
+  items.forEach((item) => {
+    if (!item.secondaryUnit) return;
+
+    (item.lots || []).forEach((lot) => {
+      if (!lot.selected || Number(lot.exitQuantity || 0) <= 0) return;
+
+      applyProportionalLotSecondaryQuantity(item, lot, lot.exitQuantity);
+    });
+  });
+}
+
 async function registerMovement(type, sourceType) {
   const items = sourceType === "IMPORT" ? importPreviewItems : movementDraftItems;
 
@@ -1987,6 +2077,10 @@ async function registerMovement(type, sourceType) {
 
   captureDraftLots();
 
+if (type === "TRANSFER") {
+  syncTransferSecondaryQuantities(items);
+}
+
 if (type === "PURCHASE") {
   const lotValidation = validatePurchaseLots(items);
 
@@ -2003,7 +2097,7 @@ if (type === "PURCHASE") {
 }
 
 if (type === "SALE" || type === "RETURN" || type === "TRANSFER") {
-  const saleValidation = validateSaleLots(items);
+  const saleValidation = validateSaleLots(items, type);
 
   if (!saleValidation.valid) {
     movementSystemNotice = {
@@ -2061,6 +2155,19 @@ if (type === "TRANSFER") {
 
   if (type === "PURCHASE") {
     const savedMovement = await createPurchaseMovementFromApi(movement, items);
+
+    if (savedMovement) {
+      addMovementToLocalStore(savedMovement);
+      resetMovementStateAfterRegister(type, sourceType, movement);
+      refreshMovimentacoesPage();
+      return;
+    }
+
+    if (savedMovement === false) return;
+  }
+
+  if (type === "TRANSFER") {
+    const savedMovement = await createTransferMovementFromApi(movement, items);
 
     if (savedMovement) {
       addMovementToLocalStore(savedMovement);
@@ -2155,6 +2262,7 @@ async function createPurchaseMovementFromApi(movement, items) {
       supplierName: movement.supplierName,
       locationName: movement.locationName,
       fiscalNumber: movement.fiscalNumber,
+      supplierCertificateNumber: movement.supplierCertificateNumber,
       observation: movement.observation,
       items: items.map((item) => ({
         materialId: item.materialId || null,
@@ -2170,6 +2278,7 @@ async function createPurchaseMovementFromApi(movement, items) {
           secondaryQuantity: lot.secondaryQuantity === "" || lot.secondaryQuantity === undefined || lot.secondaryQuantity === null
             ? null
             : Number(lot.secondaryQuantity || 0),
+          supplierCertificateNumber: lot.supplierCertificateNumber || movement.supplierCertificateNumber || "",
           notes: lot.notes || ""
         }))
       }))
@@ -2181,14 +2290,68 @@ async function createPurchaseMovementFromApi(movement, items) {
     if (!shouldUseLocalFallback(error)) {
       movementSystemNotice = {
         type: "danger",
-        title: "Compra nao registrada",
+        title: "Compra não registrada",
         message: error.message
       };
       refreshMovimentacoesPage();
       return false;
     }
 
-    console.log("API indisponivel, registrando compra localmente");
+    console.log("API indisponível, registrando compra localmente");
+    return null;
+  }
+}
+
+async function createTransferMovementFromApi(movement, items) {
+  try {
+    syncTransferSecondaryQuantities(items);
+
+    const payload = {
+      type: "TRANSFER",
+      movementDate: movement.movementDate,
+      originLocationName: movement.originLocation,
+      destinationLocationName: movement.destinationLocation,
+      fiscalNumber: movement.fiscalNumber,
+      observation: movement.observation,
+      stockExitMode: movement.stockExitMode,
+      items: items.map((item) => ({
+        materialId: item.materialId || null,
+        materialCode: item.materialCode,
+        materialName: item.materialName,
+        quantity: Number(item.quantity || 0),
+        unit: item.unit,
+        secondaryQuantity: getItemSecondaryQuantity(item),
+        secondaryUnit: item.secondaryUnit || "",
+        lots: (item.lots || [])
+          .filter((lot) => lot.selected && Number(lot.exitQuantity || 0) > 0)
+          .map((lot) => ({
+            lotId: lot.lotId || lot.sourceLotId || null,
+            sourceLotId: lot.sourceLotId || lot.lotId || null,
+            lotCode: lot.lotCode,
+            quantity: Number(lot.exitQuantity || 0),
+            secondaryQuantity: !item.secondaryUnit || lot.secondaryQuantity === "" || lot.secondaryQuantity === undefined || lot.secondaryQuantity === null
+              ? null
+              : calculateProportionalLotSecondaryQuantity(lot, lot.exitQuantity),
+            exitMode: lot.exitMode || "",
+            notes: lot.notes || ""
+          }))
+      }))
+    };
+
+    const savedMovement = await apiPost("/api/stock-movements", payload);
+    return normalizeApiMovement(savedMovement);
+  } catch (error) {
+    if (!shouldUseLocalFallback(error)) {
+      movementSystemNotice = {
+        type: "danger",
+        title: "Transferência não registrada",
+        message: error.message
+      };
+      refreshMovimentacoesPage();
+      return false;
+    }
+
+    console.log("API indisponível, registrando transferência localmente");
     return null;
   }
 }
@@ -2256,6 +2419,7 @@ stockExitModeLabel:
     originLocation: document.getElementById("movementOriginLocation")?.value || "",
     destinationLocation: document.getElementById("movementDestinationLocation")?.value || "",
     fiscalNumber: document.getElementById("movementFiscalNumber")?.value || "",
+    supplierCertificateNumber: document.getElementById("movementSupplierCertificateNumber")?.value || "",
     attachmentName: attachment?.name || importFile?.name || "",
 attachmentUrl: purchaseAttachmentUrl || (attachment ? URL.createObjectURL(attachment) : ""),
     reason: document.getElementById("movementReason")?.value || "",
@@ -2984,12 +3148,56 @@ function getAvailableLotsForSale(materialName, requestedQuantity = 0) {
   return lots;
 }
 
-function getAvailableLotsForTransfer(materialName, requestedQuantity = 0) {
+async function getAvailableLotsForTransfer(materialName, requestedQuantity = 0, material = null) {
   const originLocation = document.getElementById("movementOriginLocation")?.value || transferFormState.originLocation || "";
 
   if (!originLocation) return [];
 
-  let lots = [];
+  let lots = await fetchAvailableLotsForTransfer({ materialName, material, originLocation });
+
+  if (!lots.length) {
+    lots = getAvailableLotsForTransferFromLocalHistory(materialName, originLocation);
+  }
+
+  if (transferFormState.stockExitMode === "FIFO") {
+    return applyFifoSelection(lots, requestedQuantity);
+  }
+
+  return lots;
+}
+
+async function fetchAvailableLotsForTransfer({ materialName, material, originLocation }) {
+  try {
+    const params = new URLSearchParams();
+
+    if (material?.id) {
+      params.set("materialId", material.id);
+    } else {
+      params.set("materialName", materialName);
+    }
+
+    params.set("originLocationName", originLocation);
+
+    const lots = await apiGet(`/api/stock/available-lots?${params.toString()}`);
+
+    return Array.isArray(lots)
+      ? lots
+          .filter((lot) => isTransferLotAvailable(lot, material, originLocation))
+          .map(normalizeTransferAvailableLot)
+      : [];
+  } catch (error) {
+    console.log(
+      shouldUseLocalFallback(error)
+        ? "API indisponível ao buscar lotes de transferência; usando histórico local"
+        : `Lotes de transferência não carregados: ${error.message}`
+    );
+
+    return [];
+  }
+}
+
+function getAvailableLotsForTransferFromLocalHistory(materialName, originLocation) {
+  const lots = [];
 
   lineStore.stockMovementItems.forEach((item) => {
     if (item.materialName !== materialName) return;
@@ -3015,38 +3223,86 @@ function getAvailableLotsForTransfer(materialName, requestedQuantity = 0) {
 
       if (availableQuantity <= 0) return;
 
-      lots.push({
-        id: crypto.randomUUID(),
+      lots.push(normalizeTransferAvailableLot({
+        ...lot,
         sourceLotId: lot.sourceLotId || lot.id,
-        lotCode: lot.lotCode,
+        materialName: item.materialName,
+        locationName: originLocation,
         availableQuantity,
         availableSecondaryQuantity: Number(lot.secondaryQuantity || 0),
-        secondaryUnit: item.secondaryUnit || "",
-        selected: false,
-        exitMode: "PARTIAL",
-        exitQuantity: 0
-      });
+        secondaryUnit: item.secondaryUnit || lot.secondaryUnit || ""
+      }));
     });
   });
 
-  if (transferFormState.stockExitMode === "FIFO") {
-    let remaining = Number(requestedQuantity || 0);
+  return lots;
+}
 
-    return lots.map((lot) => {
-      const quantityToExit = Math.min(lot.availableQuantity, remaining);
+function normalizeTransferAvailableLot(lot) {
+  return {
+    id: crypto.randomUUID(),
+    sourceLotId: lot.sourceLotId || lot.lotId || lot.id,
+    lotId: lot.lotId || lot.sourceLotId || lot.id,
+    lotCode: lot.lotCode,
+    availableQuantity: Number(lot.availableQuantity ?? lot.quantity ?? 0),
+    availableSecondaryQuantity: Number(lot.availableSecondaryQuantity ?? lot.secondaryQuantity ?? 0),
+    secondaryUnit: lot.secondaryUnit || "",
+    productionDate: lot.productionDate || lot.createdAt || "",
+    locationId: lot.locationId || "",
+    locationName: lot.locationName || "",
+    selected: false,
+    exitMode: "PARTIAL",
+    exitQuantity: 0
+  };
+}
 
-      remaining -= quantityToExit;
+function isTransferLotAvailable(lot, material, originLocation) {
+  const sameMaterial = material?.id
+    ? lot.materialId === material.id
+    : !material || lot.materialName === material.name || lot.materialName === material.materialName;
+  const sameOrigin = lot.locationName === originLocation;
+  const status = normalizeCode(lot.status || "Disponivel");
 
-      return {
-        ...lot,
-        selected: quantityToExit > 0,
-        exitMode: "FIFO",
-        exitQuantity: quantityToExit
-      };
+  return sameMaterial &&
+    sameOrigin &&
+    Number(lot.availableQuantity ?? lot.quantity ?? 0) > 0 &&
+    ["disponivel", "ativo"].includes(status);
+}
+
+function applyFifoSelection(lots, requestedQuantity = 0) {
+  let remaining = Number(requestedQuantity || 0);
+
+  return lots.map((lot) => {
+    const quantityToExit = Math.min(Number(lot.availableQuantity || 0), remaining);
+
+    remaining -= quantityToExit;
+
+    return {
+      ...lot,
+      selected: quantityToExit > 0,
+      exitMode: "FIFO",
+      exitQuantity: quantityToExit
+    };
+  });
+}
+
+async function refreshTransferDraftLotsForOrigin() {
+  if (!movementDraftItems.length) {
+    refreshMovimentacoesPage();
+    return;
+  }
+
+  movementSystemNotice = null;
+
+  for (const item of movementDraftItems) {
+    const material = findMaterialByName(item.materialName);
+    item.lots = await getAvailableLotsForTransfer(item.materialName, item.quantity, material);
+    item.lots.forEach((lot) => {
+      applyProportionalLotSecondaryQuantity(item, lot, lot.exitQuantity);
     });
   }
 
-  return lots;
+  refreshMovimentacoesPage();
 }
 
 function getAvailableLotsForAdjustment(materialName) {
@@ -3356,6 +3612,7 @@ movement.dateTime = isDateOnlyMovement
   movement.locationName = document.getElementById("editMovementLocation")?.value || "";
 }
   movement.fiscalNumber = document.getElementById("editMovementFiscalNumber")?.value || "";
+  movement.supplierCertificateNumber = document.getElementById("editMovementSupplierCertificateNumber")?.value || "";
   movement.observation = document.getElementById("editMovementObservation")?.value || "";
 
   if (attachment) {
@@ -3488,13 +3745,13 @@ async function changePurchaseMovementStatusFromApi(movementId, action) {
     return true;
   } catch (error) {
     if (shouldUseLocalFallback(error)) {
-      console.log("API indisponivel, alterando status da compra localmente");
+      console.log("API indisponível, alterando status da compra localmente");
       return null;
     }
 
     movementSystemNotice = {
       type: "danger",
-      title: action === "cancel" ? "Compra nao cancelada" : "Compra nao reprocessada",
+      title: action === "cancel" ? "Compra não cancelada" : "Compra não reprocessada",
       message: error.message
     };
     movementDeleteTargetId = null;
@@ -3571,7 +3828,7 @@ async function loadPurchaseReferencesFromApi() {
     lineStore.suppliers.splice(0, lineStore.suppliers.length, ...apiSuppliers.map(normalizeApiSupplier).filter(isActiveItem));
     refreshMovimentacoesPage();
   } catch (error) {
-    console.log("API indisponivel, usando referencias locais de movimentacoes");
+    console.log("API indisponível, usando referências locais de movimentações");
   }
 }
 
@@ -3583,11 +3840,19 @@ async function loadPurchaseMovementsFromApi(force = false) {
   try {
     const apiMovements = await apiGet("/api/stock-movements");
     const purchases = apiMovements.map(normalizeApiMovement);
+    const persistedMovementIds = new Set(purchases.map((movement) => movement.id));
+    const localMovementTypesById = new Map(
+      lineStore.stockMovements.map((movement) => [movement.id, movement.type])
+    );
 
     lineStore.stockMovements.splice(
       0,
       lineStore.stockMovements.length,
-      ...lineStore.stockMovements.filter((movement) => movement.type !== "PURCHASE"),
+      ...lineStore.stockMovements.filter((movement) => {
+        return !persistedMovementIds.has(movement.id) &&
+          movement.type !== "PURCHASE" &&
+          movement.type !== "TRANSFER";
+      }),
       ...purchases
     );
 
@@ -3595,7 +3860,11 @@ async function loadPurchaseMovementsFromApi(force = false) {
       0,
       lineStore.stockMovementItems.length,
       ...lineStore.stockMovementItems.filter((item) => {
-        return !purchases.some((movement) => movement.id === item.movementId);
+        const movementType = localMovementTypesById.get(item.movementId);
+
+        return !persistedMovementIds.has(item.movementId) &&
+          movementType !== "PURCHASE" &&
+          movementType !== "TRANSFER";
       })
     );
 
@@ -3605,14 +3874,14 @@ async function loadPurchaseMovementsFromApi(force = false) {
     if (!shouldUseLocalFallback(error)) {
       movementSystemNotice = {
         type: "danger",
-        title: "Historico nao recarregado",
+        title: "Histórico não recarregado",
         message: error.message
       };
       refreshMovimentacoesPage();
       return;
     }
 
-    console.log("API indisponivel, usando historico local de compras");
+    console.log("API indisponível, usando histórico local de compras");
   }
 }
 
@@ -3624,8 +3893,8 @@ async function reloadPurchaseMovementsAndStockFromApi() {
   } catch (error) {
     console.log(
       shouldUseLocalFallback(error)
-        ? "API indisponivel ao recarregar estoque apos movimentacao"
-        : `Estoque nao recarregado: ${error.message}`
+        ? "API indisponível ao recarregar estoque após movimentação"
+        : `Estoque não recarregado: ${error.message}`
     );
   }
 }
@@ -3657,9 +3926,14 @@ function normalizeApiMovement(movement) {
     movementDate: getDateOnly(movement.movementDate || movement.dateTime || movement.createdAt),
     locationId: movement.locationId || "",
     locationName: movement.locationName || "",
+    originLocationId: movement.originLocationId || "",
+    originLocation: movement.originLocation || "",
+    destinationLocationId: movement.destinationLocationId || "",
+    destinationLocation: movement.destinationLocation || "",
     supplierId: movement.supplierId || "",
     supplierName: movement.supplierName || "",
     fiscalNumber: movement.fiscalNumber || movement.documentNumber || "",
+    supplierCertificateNumber: movement.supplierCertificateNumber || "",
     observation: movement.observation || movement.notes || "",
     status: movement.status || "Processado",
     responsibleName: movement.responsibleName || "API",
@@ -3690,6 +3964,7 @@ function normalizeApiMovementItem(item) {
       secondaryQuantity: Number(lot.secondaryQuantity || 0),
       secondaryUnit: lot.secondaryUnit || item.secondaryUnit || "",
       locationName: lot.locationName || "",
+      supplierCertificateNumber: lot.supplierCertificateNumber || "",
       productionDate: lot.productionDate || ""
     })) : []
   };

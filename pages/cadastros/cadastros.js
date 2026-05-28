@@ -48,10 +48,17 @@ function renderCadastros() {
   tag: "Compras",
   route: "cadastros-fornecedores"
 },
+{
+  icon: "&#128666;",
+  title: "Veículos",
+  description: "Caminhões, carretas e veículos usados nos carregamentos da expedição.",
+  tag: "Expedição",
+  route: "cadastros-veiculos"
+},
   {
   icon: "📐",
-  title: "Parâmetros técnicos",
-  description: "Regras, fatores, tolerâncias e configurações técnicas usadas nos cálculos.",
+  title: "Parâmetros",
+  description: "Regras de qualidade, lote, estoque e expedição em um único lugar.",
   tag: "Técnico",
   route: "cadastros-parametros"
 },

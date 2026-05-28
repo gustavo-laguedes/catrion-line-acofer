@@ -7,6 +7,9 @@ export const lineStore = {
   operatorRoles: [],
   technicalParameters: [],
   suppliers: [],
+  vehicles: [],
+  expeditionParameters: [],
+  expeditionHistory: [],
   stockBalances: [],
   stockLots: [],
   stockMovements: [],
@@ -16,6 +19,11 @@ export const lineStore = {
   productionRecords: [],
   productionRecordItems: [],
   productionGeneratedLots: [],
+  industrialLossEvents: [],
+  stockLossParameters: {
+    globalLossPercent: 10,
+    materialLossPercents: {}
+  },
   productionLotPattern: {
     format: "DDMMAA + MATERIAL + MAQUINA + SEQUENCIAL",
     materialCodeLength: 3,
@@ -91,6 +99,28 @@ export function getStockBalances() {
 
 export function saveStockBalances(stockBalances) {
   lineStore.stockBalances = stockBalances;
+}
+
+export function getStockLossParameters() {
+  if (!lineStore.stockLossParameters) {
+    lineStore.stockLossParameters = {};
+  }
+
+  lineStore.stockLossParameters = {
+    globalLossPercent: Number(lineStore.stockLossParameters.globalLossPercent ?? 10),
+    materialLossPercents: lineStore.stockLossParameters.materialLossPercents || {}
+  };
+
+  return lineStore.stockLossParameters;
+}
+
+export function saveStockLossParameters(parameters = {}) {
+  lineStore.stockLossParameters = {
+    globalLossPercent: Number(parameters.globalLossPercent ?? 10),
+    materialLossPercents: parameters.materialLossPercents || {}
+  };
+
+  return lineStore.stockLossParameters;
 }
 
 export function getStockStatus(balance) {

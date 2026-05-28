@@ -6,7 +6,7 @@
 create extension if not exists "uuid-ossp";
 
 -- =========================
--- CONFIGURAÇÃO DA EMPRESA / INSTÂNCIA
+-- CONFIGURACAO DA EMPRESA / INSTANCIA
 -- Cada banco representa uma empresa.
 -- =========================
 
@@ -118,7 +118,7 @@ create table if not exists machines (
 );
 
 -- =========================
--- OPERADORES / PESSOAS DE PRODUÇÃO
+-- OPERADORES / PESSOAS DE PRODUCAO
 -- =========================
 
 create table if not exists operators (
@@ -131,7 +131,7 @@ create table if not exists operators (
 );
 
 -- =========================
--- FICHA TÉCNICA / COMPOSIÇÃO
+-- FICHA TECNICA / COMPOSICAO
 -- Sempre olhando para o material de origem.
 -- =========================
 
@@ -217,7 +217,7 @@ create table if not exists stock_movements (
 );
 
 -- =========================
--- ORDENS DE PRODUÇÃO
+-- ORDENS DE PRODUCAO
 -- =========================
 
 create table if not exists production_orders (
@@ -242,7 +242,7 @@ create table if not exists production_orders (
 );
 
 -- =========================
--- APONTAMENTOS DE PRODUÇÃO
+-- APONTAMENTOS DE PRODUCAO
 -- =========================
 
 create table if not exists production_entries (

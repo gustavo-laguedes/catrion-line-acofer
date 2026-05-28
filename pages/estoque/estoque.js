@@ -76,7 +76,16 @@ function findMaterial(balance) {
 
 function renderStockFilters() {
   return `
-    <div class="stock-filters">
+    <div class="stock-filters-panel">
+      <div class="stock-filters-header">
+        <strong>Filtros de estoque</strong>
+        <div class="stock-filters-actions">
+        <button class="secondary-btn small-action-btn" id="expandAllStockRowsBtn">Abrir todos</button>
+        <button class="secondary-btn small-action-btn" id="collapseAllStockRowsBtn">Fechar todos</button>
+        </div>
+      </div>
+
+      <div class="stock-filters">
       <label class="stock-search">
         Buscar
         <input id="stockSearchInput" type="text" placeholder="Material, código ou local" value="${stockFilters.search}" />
@@ -102,6 +111,7 @@ function renderStockFilters() {
           ${renderOptions(["Todos", "Normal", "Baixo estoque", "Sem saldo"], stockFilters.status)}
         </select>
       </label>
+      </div>
     </div>
   `;
 }
@@ -444,6 +454,8 @@ function setupEstoqueEvents(options = {}) {
   const typeFilter = document.getElementById("stockTypeFilter");
   const locationFilter = document.getElementById("stockLocationFilter");
   const statusFilter = document.getElementById("stockStatusFilter");
+  const expandAllBtn = document.getElementById("expandAllStockRowsBtn");
+  const collapseAllBtn = document.getElementById("collapseAllStockRowsBtn");
 
   searchInput?.addEventListener("input", (event) => {
     stockFilters.search = event.target.value;
@@ -462,6 +474,17 @@ function setupEstoqueEvents(options = {}) {
 
   statusFilter?.addEventListener("change", (event) => {
     stockFilters.status = event.target.value;
+    refreshStockPage();
+  });
+
+  expandAllBtn?.addEventListener("click", () => {
+    const visibleBalances = applySorting(applyStockFilters(getMaterialStockGroups()));
+    expandedRows = visibleBalances.map((balance) => balance.materialCode).filter(Boolean);
+    refreshStockPage();
+  });
+
+  collapseAllBtn?.addEventListener("click", () => {
+    expandedRows = [];
     refreshStockPage();
   });
 

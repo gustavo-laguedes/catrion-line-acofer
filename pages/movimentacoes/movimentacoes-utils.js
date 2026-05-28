@@ -85,6 +85,28 @@ export function calculateFixedSecondaryQuantity(item = {}, primaryQuantity = 0) 
   return (Number(primaryQuantity || 0) * baseSecondary) / basePrimary;
 }
 
+export function calculateProportionalLotSecondaryQuantity(lot = {}, primaryQuantity = 0) {
+  const primaryBalance = Number(lot.primary_balance ?? lot.primaryBalance ?? lot.availableQuantity ?? lot.quantity ?? 0);
+  const secondaryBalance = Number(lot.secondary_balance ?? lot.secondaryBalance ?? lot.availableSecondaryQuantity ?? lot.secondaryQuantity ?? 0);
+
+  if (primaryBalance <= 0 || secondaryBalance <= 0) return 0;
+
+  return Math.round(Number(primaryQuantity || 0) * (secondaryBalance / primaryBalance) * 1000000) / 1000000;
+}
+
+export function applyProportionalLotSecondaryQuantity(item = {}, lot = {}, primaryQuantity = 0) {
+  if (!item.secondaryUnit) {
+    delete lot.secondaryQuantity;
+    delete lot.secondaryUnit;
+    return lot;
+  }
+
+  lot.secondaryUnit = item.secondaryUnit;
+  lot.secondaryQuantity = calculateProportionalLotSecondaryQuantity(lot, primaryQuantity);
+
+  return lot;
+}
+
 export function getLotSecondaryQuantity(item = {}, lot = {}, primaryQuantity = 0) {
   if (!item.secondaryUnit) return "";
 

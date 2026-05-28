@@ -1,4 +1,4 @@
-import { lineStore, getActiveItems } from "../../shared/data-store.js";
+import { lineStore, getActiveItems, saveStockLossParameters } from "../../shared/data-store.js";
 import { buildStockSnapshot } from "../../shared/stock-engine.js";
 import { apiGet, apiPost, apiPut } from "../../shared/api-client.js";
 
@@ -43,6 +43,7 @@ function createProductionDraft() {
     machineName: "",
     operatorCodes: [],
     consumedLotCode: "",
+    consumedLotSelections: {},
     observation: ""
   };
 }
@@ -145,8 +146,8 @@ function renderProdução() {
 function renderNewProduction() {
   const material = getSelectedOutputMaterial();
   const model = getSelectedProductionModel();
-  const consumedInput = getModelConsumedInput(model);
-  const selectedConsumedLot = getSelectedConsumedLot();
+  const consumedInputs = getModelConsumedInputs(model);
+  const selectedConsumedLots = getSelectedConsumedLots();
 
   syncProducedLotCodes();
 
@@ -197,9 +198,9 @@ function renderNewProduction() {
       </div>
 
       ${renderOperatorsBox()}
-      ${renderTransformationSummary(material, model, consumedInput, selectedConsumedLot)}
-      ${renderConsumedLotBox(consumedInput)}
-      ${renderProducedLotsBox(material, consumedInput, selectedConsumedLot)}
+      ${renderTransformationSummary(material, model, consumedInputs, selectedConsumedLots)}
+      ${renderConsumedLotBox(consumedInputs)}
+      ${renderProducedLotsBox(material, consumedInputs, selectedConsumedLots)}
 
       <div class="movement-actions">
         <button id="registerProductionBtn" class="primary-btn" type="button">
@@ -247,10 +248,10 @@ function renderOperatorsBox() {
   `;
 }
 
-function renderTransformationSummary(material, model, consumedInput, selectedConsumedLot) {
+function renderTransformationSummary(material, model, consumedInputs, selectedConsumedLots) {
   return "";
 
-  if (!material || !model || !consumedInput) {
+  if (!material || !model || !consumedInputs.length) {
     return `
       <div class="production-preview-empty">
         Selecione material produzido e modelo para carregar a transformação.
@@ -265,8 +266,8 @@ function renderTransformationSummary(material, model, consumedInput, selectedCon
           <h3>${material.name}</h3>
           <p>
             Transformação:
-            <strong>${consumedInput.inputMaterial}</strong>
-            ${selectedConsumedLot ? ` lote <strong>${selectedConsumedLot.lotCode}</strong>` : ""}
+            <strong>${consumedInputs.map((input) => input.inputMaterial).join(" / ")}</strong>
+            ${selectedConsumedLots.length ? ` lote <strong>${selectedConsumedLots.map((lot) => lot.lotCode).join(" / ")}</strong>` : ""}
             → <strong>${material.name}</strong>
           </p>
         </div>
@@ -279,7 +280,7 @@ function renderTransformationSummary(material, model, consumedInput, selectedCon
   `;
 }
 
-function renderConsumedLotBox(consumedInput) {
+function renderConsumedLotBox(consumedInputs) {
   if (!productionDraft.locationName) {
     return `
       <div class="production-preview-empty">
@@ -288,23 +289,58 @@ function renderConsumedLotBox(consumedInput) {
     `;
   }
 
-  if (!consumedInput) {
+  if (!consumedInputs.length) {
     return "";
   }
-
-  const lots = getAvailableConsumedLots(consumedInput);
 
   return `
     <div class="production-consumption-box">
       <div class="production-model-preview-header">
         <div>
-          <h3>Lote consumido</h3>
-          <p>${consumedInput.inputMaterial} sai de ${productionDraft.locationName}.</p>
+          <h3>Lotes consumidos</h3>
+          <p>Selecione o lote de origem para cada insumo em ${productionDraft.locationName}.</p>
         </div>
 
         <span class="badge badge-info">
-          ${lots.length} lotes disponíveis
+          ${consumedInputs.length} insumo${consumedInputs.length > 1 ? "s" : ""}
         </span>
+      </div>
+
+      <div class="production-consumed-materials">
+        ${consumedInputs.map((input, index) => renderConsumedMaterialBlock(input, index)).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderConsumedMaterialBlock(consumedInput, index) {
+  const lots = getAvailableConsumedLots(consumedInput);
+  const selectedLotCodes = getSelectedConsumedLotCodes(consumedInput);
+  const inputKey = getConsumedInputKey(consumedInput, index);
+  const simulation = getConsumptionSimulationForInput(consumedInput, lots);
+  const selectedTotal = selectedLotCodes.reduce((sum, lotCode) => {
+    const lot = lots.find((item) => item.lotCode === lotCode);
+    return sum + Number(lot?.quantity || 0);
+  }, 0);
+
+  return `
+    <div class="production-consumed-material-card">
+      <div class="production-consumed-material-head">
+        <div>
+          <h4>${consumedInput.inputMaterial}</h4>
+          <p>
+            Necessário por unidade:
+            <strong>${formatNumber(getInputQuantityPerProducedUnit(consumedInput))} ${consumedInput.inputUnit || ""}</strong>
+            · Local: <strong>${productionDraft.locationName}</strong>
+          </p>
+        </div>
+        <span class="badge badge-info">${selectedLotCodes.length}/${lots.length} lotes</span>
+      </div>
+
+      <div class="production-selected-total">
+        <strong>Selecionado:</strong>
+        ${formatNumber(selectedTotal)} ${consumedInput.inputUnit || ""}
+        ${simulation.requiredQuantity ? ` · Consumo previsto: ${formatNumber(simulation.requiredQuantity)} ${consumedInput.inputUnit || ""}` : ""}
       </div>
 
       ${
@@ -314,14 +350,18 @@ function renderConsumedLotBox(consumedInput) {
               <div class="production-lot-table-head">
                 <span>Lote</span>
                 <span>Disponível</span>
+                <span>Após produção</span>
                 <span>Selecionar</span>
               </div>
 
-              ${lots.map((lot) => `
-                <label class="production-lot-row ${productionDraft.consumedLotCode === lot.lotCode ? "selected" : ""}">
+              ${lots.map((lot) => {
+                const projected = simulation.allocations.find((item) => item.lotCode === lot.lotCode);
+                const selected = selectedLotCodes.includes(lot.lotCode);
+                return `
+                <label class="production-lot-row production-lot-row-multi ${selected ? "selected" : ""}">
                   <div>
                     <strong>${lot.lotCode}</strong>
-                    <small>${lot.locationName}</small>
+                    <small>${lot.locationName}${lot.productionDate ? ` · ${formatDateOnly(lot.productionDate)}` : ""}</small>
                   </div>
 
                   <div>
@@ -329,20 +369,28 @@ function renderConsumedLotBox(consumedInput) {
                   </div>
 
                   <div>
+                    ${
+                      projected
+                        ? renderProjectedConsumption(projected, consumedInput.inputUnit)
+                        : selected ? "Aguardando quantidade" : "-"
+                    }
+                  </div>
+
+                  <div>
                     <input
-                      class="production-consumed-lot-radio"
-                      type="radio"
-                      name="productionConsumedLot"
+                      class="production-consumed-lot-checkbox"
+                      data-input-key="${inputKey}"
+                      type="checkbox"
                       value="${lot.lotCode}"
-                      ${productionDraft.consumedLotCode === lot.lotCode ? "checked" : ""}
+                      ${selected ? "checked" : ""}
                     />
                   </div>
                 </label>
-              `).join("")}
+              `}).join("")}
             </div>
           `
           : `
-            <div class="production-preview-empty">
+            <div class="production-preview-empty compact-production-empty">
               Nenhum lote disponível para este material no local de produção.
             </div>
           `
@@ -351,8 +399,8 @@ function renderConsumedLotBox(consumedInput) {
   `;
 }
 
-function renderProducedLotsBox(material, consumedInput, selectedConsumedLot) {
-  if (!material || !consumedInput || !selectedConsumedLot) {
+function renderProducedLotsBox(material, consumedInputs, selectedConsumedLots) {
+  if (!material || !consumedInputs.length || selectedConsumedLots.length !== consumedInputs.length) {
     return "";
   }
 
@@ -373,7 +421,17 @@ function renderProducedLotsBox(material, consumedInput, selectedConsumedLot) {
         ${producedLots.map((lot, index) => renderProducedLotCard(lot, index, material)).join("")}
       </div>
 
-      ${renderProductionLimitBox(material, consumedInput, selectedConsumedLot)}
+      ${renderProductionLimitBox(material, consumedInputs, selectedConsumedLots)}
+    </div>
+  `;
+}
+
+function renderProjectedConsumption(projected, unit = "") {
+  return `
+    <div class="production-lot-projection">
+      <span>Consumo previsto: <strong>${formatNumber(projected.consumedQuantity)} ${unit || ""}</strong></span>
+      <span>Saldo restante: <strong>${formatNumber(projected.remainingQuantity)} ${unit || ""}</strong> (${formatPercent(projected.remainingPercent)})</span>
+      ${projected.isLowStock ? `<span class="badge badge-warning production-low-stock-badge">Possível perda industrial</span>` : ""}
     </div>
   `;
 }
@@ -437,25 +495,18 @@ function renderProducedLotCard(lot, index, material) {
   `;
 }
 
-function renderProductionLimitBox(material, consumedInput, selectedConsumedLot) {
-  const summary = getProductionLimitSummary(material, consumedInput, selectedConsumedLot);
+function renderProductionLimitBox(material, consumedInputs, selectedConsumedLots) {
+  const summaries = getProductionLimitSummary(material, consumedInputs, selectedConsumedLots);
 
   return `
-    <div class="production-lot-validation ${summary.isOverLimit ? "invalid" : "valid"}" id="productionLimitSummary">
-      <span>
-        Lote consumido:
-        <strong>${formatNumber(summary.consumedQuantity)} ${consumedInput.inputUnit}</strong>
-      </span>
-
-      <span>
-        Comparado por:
-        <strong>${summary.samePrimaryUnit ? "quantidade principal" : "quantidade secundária produzida"}</strong>
-      </span>
-
-      <span>
-        Produzido:
-        <strong>${formatNumber(summary.comparedProduced)} ${summary.comparedUnit || "-"}</strong>
-      </span>
+    <div class="production-lot-validation ${summaries.some((summary) => summary.isOverLimit) ? "invalid" : "valid"}" id="productionLimitSummary">
+      ${summaries.map((summary) => `
+        <span>
+          ${summary.input.inputMaterial}:
+          <strong>${formatNumber(summary.consumedQuantity)} ${summary.input.inputUnit || ""}</strong>
+          de <strong>${formatNumber(summary.availableQuantity)} ${summary.input.inputUnit || ""}</strong> disponíveis
+        </span>
+      `).join("")}
     </div>
   `;
 }
@@ -639,7 +690,10 @@ function setupProduçãoEvents(options = {}) {
   setupProductionHistoryEvents();
   const shouldRefreshAfterLoad = options.navigation || !hasLoadedProductionApi;
   const loadPromise = loadProductionPageFromApi(Boolean(options.navigation)).then(() => {
-    if (shouldRefreshAfterLoad) rerenderProdução();
+    if (shouldRefreshAfterLoad) {
+      syncProducedLotCodes(true);
+      rerenderProdução();
+    }
   });
 
   document.querySelectorAll("[data-production-tab]").forEach((button) => {
@@ -657,7 +711,7 @@ function setupProduçãoEvents(options = {}) {
 
   document.getElementById("productionLocation")?.addEventListener("change", () => {
     captureProductionDraft();
-    productionDraft.consumedLotCode = "";
+    resetConsumedLotSelections();
     rerenderProdução();
   });
 
@@ -665,7 +719,7 @@ function setupProduçãoEvents(options = {}) {
     captureProductionDraft();
     productionDraft.productionModelName = "";
     productionDraft.machineName = "";
-    productionDraft.consumedLotCode = "";
+    resetConsumedLotSelections();
     producedLots = [createProducedLotDraft(1)];
     applyProductionDefaults();
     syncProducedLotCodes(true);
@@ -675,7 +729,7 @@ function setupProduçãoEvents(options = {}) {
   document.getElementById("productionModel")?.addEventListener("change", () => {
     captureProductionDraft();
     productionDraft.locationName = "";
-    productionDraft.consumedLotCode = "";
+    resetConsumedLotSelections();
     applyProductionDefaults();
     syncProducedLotCodes(true);
     rerenderProdução();
@@ -697,9 +751,18 @@ function setupProduçãoEvents(options = {}) {
     });
   });
 
-  document.querySelectorAll(".production-consumed-lot-radio").forEach((input) => {
+  document.querySelectorAll(".production-consumed-lot-checkbox").forEach((input) => {
     input.addEventListener("change", () => {
-      productionDraft.consumedLotCode = input.value;
+      const current = normalizeSelectedLotCodes((productionDraft.consumedLotSelections || {})[input.dataset.inputKey]);
+      const next = input.checked
+        ? [...new Set([...current, input.value])]
+        : current.filter((lotCode) => lotCode !== input.value);
+
+      productionDraft.consumedLotSelections = {
+        ...(productionDraft.consumedLotSelections || {}),
+        [input.dataset.inputKey]: next
+      };
+      productionDraft.consumedLotCode = next[0] || "";
       rerenderProdução();
     });
   });
@@ -753,8 +816,8 @@ function registerProduction() {
 
   const material = getSelectedOutputMaterial();
   const model = getSelectedProductionModel();
-  const consumedInput = getModelConsumedInput(model);
-  const consumedLot = getSelectedConsumedLot();
+  const consumedInputs = getModelConsumedInputs(model);
+  const selectedConsumedLots = getSelectedConsumedLots();
   const machineRequired = getAllowedMachines(material).length > 0;
 
   if (!productionDraft.locationName) {
@@ -803,8 +866,13 @@ function registerProduction() {
     return;
   }
 
-  if (!consumedInput || !consumedLot) {
-    showProductionError("Selecione o lote consumido.");
+  if (!consumedInputs.length) {
+    showProductionError("Modelo de produção sem insumo consumido.");
+    return;
+  }
+
+  if (selectedConsumedLots.length !== consumedInputs.length) {
+    showProductionError("Selecione o lote consumido para todos os insumos obrigatórios.");
     return;
   }
 
@@ -831,7 +899,7 @@ function registerProduction() {
     return;
   }
 
-  const validation = validateProducedLimit(material, consumedInput, consumedLot, validProducedLots);
+  const validation = validateProducedLimit(material, consumedInputs, selectedConsumedLots, validProducedLots);
 
   if (!validation.valid) {
     showProductionError(validation.message);
@@ -840,7 +908,9 @@ function registerProduction() {
 
   const totalOutputQuantity = validProducedLots.reduce((sum, lot) => sum + lot.outputQuantity, 0);
   const totalOutputSecondaryQuantity = validProducedLots.reduce((sum, lot) => sum + lot.outputSecondaryQuantity, 0);
-  const consumedQuantity = validation.consumedQuantity;
+  const consumedItems = validation.consumedItems;
+  const consumedQuantity = consumedItems.reduce((sum, item) => sum + item.consumedQuantity, 0);
+  const lossCandidates = getIndustrialLossCandidates(consumedItems);
 
   const record = {
     id: crypto.randomUUID(),
@@ -867,63 +937,15 @@ function registerProduction() {
   pendingProductionPayload = {
     record,
     producedLots: validProducedLots,
-    consumedInput,
-    consumedLot,
-    consumedQuantity
+    consumedInputs,
+    consumedItems,
+    consumedQuantity,
+    lossCandidates,
+    selectedLossIds: lossCandidates.map((loss) => loss.id)
   };
 
   openProductionConfirmModal(pendingProductionPayload);
-  return;
-
-  lineStore.productionRecords.unshift(record);
-
-  validProducedLots.forEach((lot) => {
-    lineStore.productionGeneratedLots.unshift({
-      id: crypto.randomUUID(),
-      productionRecordId: record.id,
-      materialName: record.outputMaterialName,
-      materialCode: record.outputMaterialCode,
-      materialType: record.outputMaterialType,
-      lotCode: lot.lotCode,
-      locationName: record.locationName,
-      quantity: lot.outputQuantity,
-      secondaryQuantity: lot.outputSecondaryQuantity,
-      unit: record.outputUnit,
-      secondaryUnit: record.outputSecondaryUnit,
-      origin: "Produção",
-      productionDate: record.productionDate,
-      createdAt: new Date().toISOString()
-    });
-  });
-
-  lineStore.productionRecordItems.unshift({
-    id: crypto.randomUUID(),
-    productionRecordId: record.id,
-    inputMaterial: consumedInput.inputMaterial,
-    inputCode: consumedInput.inputCode,
-    inputUnit: consumedInput.inputUnit,
-    consumptionMode: consumedInput.consumptionMode,
-    requiredQuantity: consumedQuantity,
-    consumedLots: [
-      {
-        sourceLotId: consumedLot.id,
-        lotCode: consumedLot.lotCode,
-        locationName: consumedLot.locationName,
-        quantity: consumedQuantity
-      }
-    ],
-    sourceLocation: productionDraft.locationName,
-    notes: consumedInput.notes || ""
-  });
-
-  productionDraft = createProductionDraft();
-  producedLots = [createProducedLotDraft(1)];
-  productionNotice = null;
-  activeProductionTab = "HISTORY";
-
-  rerenderProdução();
 }
-
 function captureProductionDraft() {
   productionDraft = {
     ...productionDraft,
@@ -1130,7 +1152,25 @@ function getAllowedMachines(material) {
 }
 
 function getModelConsumedInput(model) {
-  return (model?.inputs || [])[0] || null;
+  return getModelConsumedInputs(model)[0] || null;
+}
+
+function getModelConsumedInputs(model) {
+  return Array.isArray(model?.inputs) ? model.inputs : [];
+}
+
+function getConsumedInputKey(consumedInput, index = 0) {
+  return `${consumedInput.inputCode || consumedInput.inputMaterial || "input"}-${index}`;
+}
+
+function getInputQuantityPerProducedUnit(consumedInput) {
+  const quantity = Number(consumedInput.inputQuantity ?? consumedInput.quantity ?? 1);
+  return Number.isFinite(quantity) && quantity > 0 ? quantity : 1;
+}
+
+function resetConsumedLotSelections() {
+  productionDraft.consumedLotCode = "";
+  productionDraft.consumedLotSelections = {};
 }
 
 function getAvailableConsumedLots(consumedInput) {
@@ -1143,7 +1183,7 @@ function getAvailableConsumedLots(consumedInput) {
       return (
         lot.balanceMaterialCode === consumedInput.inputCode &&
         lot.locationName === productionDraft.locationName &&
-        Number(lot.quantity || 0) > 0
+        Number(lot.availableQuantity ?? lot.quantity ?? 0) > 0
       );
     })
     .map((lot) => ({
@@ -1152,18 +1192,50 @@ function getAvailableConsumedLots(consumedInput) {
       lotCode: lot.lotCode,
       locationName: lot.locationName,
       quantity: Number(lot.availableQuantity ?? lot.quantity ?? 0),
-      secondaryQuantity: Number(lot.secondaryQuantity || 0)
-    }));
+      secondaryQuantity: Number(lot.secondaryQuantity || 0),
+      productionDate: lot.productionDate || lot.createdAt || ""
+    }))
+    .sort(compareLotsByAge);
 }
 
-function getSelectedConsumedLot() {
-  const consumedInput = getModelConsumedInput(getSelectedProductionModel());
+function normalizeSelectedLotCodes(value) {
+  if (Array.isArray(value)) return value.filter(Boolean);
+  if (value) return [value];
+  return [];
+}
 
-  if (!consumedInput || !productionDraft.consumedLotCode) return null;
+function getSelectedConsumedLotCodes(consumedInput) {
+  const inputs = getModelConsumedInputs(getSelectedProductionModel());
+  const index = inputs.indexOf(consumedInput);
+  const key = getConsumedInputKey(consumedInput, index);
+  const selected = normalizeSelectedLotCodes((productionDraft.consumedLotSelections || {})[key]);
+  if (selected.length) return selected;
+  return inputs.length === 1 ? normalizeSelectedLotCodes(productionDraft.consumedLotCode) : [];
+}
 
-  return getAvailableConsumedLots(consumedInput).find((lot) => {
-    return lot.lotCode === productionDraft.consumedLotCode;
-  });
+function getSelectedConsumedLotGroup(consumedInput = getModelConsumedInput(getSelectedProductionModel())) {
+  if (!consumedInput) return null;
+
+  const selectedLotCodes = getSelectedConsumedLotCodes(consumedInput);
+  if (!selectedLotCodes.length) return null;
+
+  const lots = getAvailableConsumedLots(consumedInput)
+    .filter((lot) => selectedLotCodes.includes(lot.lotCode))
+    .sort(compareLotsByAge);
+
+  if (!lots.length) return null;
+
+  return {
+    input: consumedInput,
+    lots,
+    quantity: lots.reduce((sum, lot) => sum + Number(lot.quantity || 0), 0)
+  };
+}
+
+function getSelectedConsumedLots() {
+  return getModelConsumedInputs(getSelectedProductionModel())
+    .map((input) => getSelectedConsumedLotGroup(input))
+    .filter(Boolean);
 }
 
 function normalizeProducedLots() {
@@ -1206,6 +1278,23 @@ function getProductionLotPrefix() {
   return `${datePart}${materialLotCode}${machineLotCode}`;
 }
 
+function getProductionLotCodeContext() {
+  const material = getSelectedOutputMaterial();
+  const machine = getSelectedProductionMachine();
+  const materialLotCode = normalizeProductionLotPart(material?.lotCode || material?.lot_code, 3, true);
+  const machineLotCode = normalizeProductionLotPart(machine?.lotCode || machine?.lot_code, 5, false);
+  const prefix = getProductionLotPrefix();
+
+  if (!prefix) return null;
+
+  return {
+    productionDate: productionDraft.date,
+    materialLotCode,
+    machineLotCode,
+    prefix
+  };
+}
+
 function generateProductionLotCode({ productionDate, materialLotCode, machineLotCode, existingLots = [] }) {
   const prefix = `${formatProductionLotDate(productionDate)}${materialLotCode}${machineLotCode}`;
   const sequenceNumbers = existingLots
@@ -1237,20 +1326,18 @@ function getExistingProductionLotCodes() {
 }
 
 function syncProducedLotCodes(force = false) {
-  const prefix = getProductionLotPrefix();
+  const context = getProductionLotCodeContext();
 
-  if (!prefix) return;
+  if (!context) return;
 
   const existingLots = getExistingProductionLotCodes();
-  const materialLotCode = prefix.slice(6, 9);
-  const machineLotCode = prefix.slice(9, 14);
 
   producedLots.forEach((lot) => {
-    if (force || !lot.lotCode || !String(lot.lotCode).startsWith(prefix)) {
+    if (force || !lot.lotCode || !String(lot.lotCode).startsWith(context.prefix)) {
       lot.lotCode = generateProductionLotCode({
-        productionDate: productionDraft.date,
-        materialLotCode,
-        machineLotCode,
+        productionDate: context.productionDate,
+        materialLotCode: context.materialLotCode,
+        machineLotCode: context.machineLotCode,
         existingLots
       });
     }
@@ -1291,61 +1378,229 @@ function validateProducedLotCodes(lots) {
   return { valid: true };
 }
 
-function validateProducedLimit(material, consumedInput, consumedLot, lots) {
-  const consumedQuantity = getConsumedQuantityForProducedLots(material, consumedInput, lots);
+function compareLotsByAge(a, b) {
+  const dateA = new Date(a.productionDate || a.createdAt || 0).getTime() || 0;
+  const dateB = new Date(b.productionDate || b.createdAt || 0).getTime() || 0;
+  if (dateA !== dateB) return dateA - dateB;
+  return String(a.lotCode || a.id || "").localeCompare(String(b.lotCode || b.id || ""));
+}
 
-  if (consumedQuantity <= 0) {
-    return {
-      valid: false,
-      message: "Informe as quantidades produzidas para validar o consumo."
+function getStockLossParameters() {
+  if (!lineStore.stockLossParameters) {
+    lineStore.stockLossParameters = {
+      globalLossPercent: 10,
+      materialLossPercents: {}
     };
   }
 
-  if (material.unit !== consumedInput.inputUnit && !material.secondaryUnit) {
-    return {
-      valid: false,
-      message: "A unidade principal produzida é diferente da consumida e o material produzido não possui unidade secundária para comparação."
-    };
-  }
+  lineStore.stockLossParameters.materialLossPercents = lineStore.stockLossParameters.materialLossPercents || {};
+  lineStore.stockLossParameters.globalLossPercent = Number(lineStore.stockLossParameters.globalLossPercent ?? 10);
+  return lineStore.stockLossParameters;
+}
 
-  if (consumedQuantity > Number(consumedLot.quantity || 0)) {
+function getLossThresholdForInput(consumedInput) {
+  const params = getStockLossParameters();
+  const materialKey = consumedInput?.inputCode || consumedInput?.inputMaterial || "";
+  const override = params.materialLossPercents[materialKey];
+  const threshold = override === "" || override === null || override === undefined
+    ? params.globalLossPercent
+    : Number(override);
+
+  return Number.isFinite(threshold) ? threshold : 10;
+}
+
+function simulateLotConsumption(lots, requiredQuantity, consumedInput) {
+  let remainingToConsume = Number(requiredQuantity || 0);
+  const threshold = getLossThresholdForInput(consumedInput);
+
+  return [...(lots || [])].sort(compareLotsByAge).map((lot) => {
+    const originalQuantity = Number(lot.quantity || 0);
+    const consumedQuantity = Math.min(originalQuantity, Math.max(remainingToConsume, 0));
+    remainingToConsume -= consumedQuantity;
+    const remainingQuantity = Math.max(originalQuantity - consumedQuantity, 0);
+    const remainingPercent = originalQuantity > 0 ? (remainingQuantity / originalQuantity) * 100 : 0;
+
     return {
-      valid: false,
-      message: "A produção informada ultrapassa a quantidade disponível no lote consumido."
+      ...lot,
+      consumedQuantity,
+      remainingQuantity,
+      remainingPercent,
+      thresholdPercent: threshold,
+      isLowStock: consumedQuantity > 0 && remainingQuantity > 0 && remainingPercent <= threshold
     };
+  }).filter((lot) => lot.consumedQuantity > 0);
+}
+
+function getConsumptionSimulationForInput(consumedInput, lots = getAvailableConsumedLots(consumedInput)) {
+  const material = getSelectedOutputMaterial();
+  const requiredQuantity = getConsumedQuantityForProducedLots(material, consumedInput, producedLots);
+  const selectedCodes = getSelectedConsumedLotCodes(consumedInput);
+  const selectedLots = lots.filter((lot) => selectedCodes.includes(lot.lotCode));
+
+  return {
+    requiredQuantity,
+    allocations: simulateLotConsumption(selectedLots, requiredQuantity, consumedInput)
+  };
+}
+
+function getIndustrialLossCandidates(consumedItems) {
+  return consumedItems.flatMap((item) => {
+    return (item.allocations || [])
+      .filter((allocation) => allocation.isLowStock)
+      .map((allocation) => ({
+        id: `${item.consumedInput.inputCode || item.consumedInput.inputMaterial}-${allocation.lotCode}`,
+        inputMaterial: item.consumedInput.inputMaterial,
+        inputCode: item.consumedInput.inputCode,
+        inputUnit: item.consumedInput.inputUnit,
+        lotId: allocation.lotId || allocation.id,
+        sourceLotId: allocation.id,
+        lotCode: allocation.lotCode,
+        locationName: allocation.locationName,
+        remainingQuantity: allocation.remainingQuantity,
+        remainingPercent: allocation.remainingPercent,
+        thresholdPercent: allocation.thresholdPercent,
+        secondaryQuantity: 0
+      }));
+  });
+}
+
+function getSelectedLossesFromConfirmModal() {
+  return Array.from(document.querySelectorAll(".production-loss-checkbox:checked"))
+    .map((input) => input.value);
+}
+
+function buildConsumedLotsWithLosses(item, selectedLossIds = []) {
+  const allocations = (item.allocations || []).map((allocation) => ({
+    sourceLotId: allocation.id,
+    lotId: allocation.lotId || allocation.id,
+    lotCode: allocation.lotCode,
+    locationName: allocation.locationName,
+    quantity: allocation.consumedQuantity,
+    secondaryQuantity: null,
+    eventType: "PRODUCTION_CONSUME"
+  }));
+
+  const selectedLosses = getIndustrialLossCandidates([item])
+    .filter((loss) => selectedLossIds.includes(loss.id))
+    .map((loss) => ({
+      sourceLotId: loss.sourceLotId,
+      lotId: loss.lotId,
+      lotCode: loss.lotCode,
+      locationName: loss.locationName,
+      quantity: loss.remainingQuantity,
+      secondaryQuantity: loss.secondaryQuantity,
+      eventType: "INDUSTRIAL_LOSS",
+      isIndustrialLoss: true,
+      notes: "Perda industrial do saldo remanescente após produção"
+    }));
+
+  return [...allocations, ...selectedLosses].filter((lot) => Number(lot.quantity || 0) > 0);
+}
+
+function validateProducedLimit(material, consumedInputs, selectedConsumedLots, lots) {
+  const consumedItems = consumedInputs.map((input, index) => {
+    const consumedLotGroup = selectedConsumedLots[index];
+    const consumedQuantity = getConsumedQuantityForProducedLots(material, input, lots);
+    const allocations = consumedLotGroup
+      ? simulateLotConsumption(consumedLotGroup.lots, consumedQuantity, input)
+      : [];
+
+    return {
+      consumedInput: input,
+      consumedLotGroup,
+      consumedLots: consumedLotGroup?.lots || [],
+      consumedQuantity,
+      allocations
+    };
+  });
+
+  for (const item of consumedItems) {
+    if (item.consumedQuantity === null) {
+      return {
+        valid: false,
+        message: `A unidade consumida de ${item.consumedInput.inputMaterial} precisa ser igual à unidade principal ou secundária do material produzido.`
+      };
+    }
+
+    if (item.consumedQuantity <= 0) {
+      return {
+        valid: false,
+        message: "Informe as quantidades produzidas para validar o consumo."
+      };
+    }
+
+    if (!item.consumedLotGroup || !item.consumedLots.length) {
+      return {
+        valid: false,
+        message: `Selecione o lote consumido para ${item.consumedInput.inputMaterial}.`
+      };
+    }
+
+    const availableQuantity = item.consumedLots.reduce((sum, lot) => sum + Number(lot.quantity || 0), 0);
+
+    if (item.consumedQuantity > availableQuantity + 0.0001) {
+      return {
+        valid: false,
+        message: `A produção informada ultrapassa a quantidade disponível no lote de ${item.consumedInput.inputMaterial}.`
+      };
+    }
   }
 
   return {
     valid: true,
-    consumedQuantity
+    consumedItems
   };
 }
 
-function getProductionLimitSummary(material, consumedInput, consumedLot) {
+function getProductionLimitSummary(material, consumedInputs, selectedConsumedLots) {
   const totalPrincipal = getProducedTotalPrincipal();
   const totalSecondary = getProducedTotalSecondary();
-  const samePrimaryUnit = material.unit === consumedInput.inputUnit;
-  const comparedProduced = samePrimaryUnit ? totalPrincipal : totalSecondary;
-  const comparedUnit = samePrimaryUnit ? material.unit : material.secondaryUnit;
-  const consumedQuantity = Number(consumedLot.quantity || 0);
 
-  return {
-    totalPrincipal,
-    totalSecondary,
-    samePrimaryUnit,
-    comparedProduced,
-    comparedUnit,
-    consumedQuantity,
-    isOverLimit: comparedProduced > consumedQuantity
-  };
+  return consumedInputs.map((input, index) => {
+    const consumedLot = selectedConsumedLots[index];
+    const consumedQuantity = getConsumedQuantityForProducedLots(material, input, producedLots);
+    const availableQuantity = Number(consumedLot?.quantity || 0);
+
+    return {
+      input,
+      consumedLot,
+      totalPrincipal,
+      totalSecondary,
+      consumedQuantity: consumedQuantity ?? 0,
+      availableQuantity,
+      isOverLimit: (consumedQuantity ?? 0) > availableQuantity
+    };
+  });
 }
 
 function getConsumedQuantityForProducedLots(material, consumedInput, lots) {
-  if (material.unit === consumedInput.inputUnit) {
-    return lots.reduce((sum, lot) => sum + lot.outputQuantity, 0);
+  const totalOutputQuantity = lots.reduce((sum, lot) => sum + Number(lot.outputQuantity || 0), 0);
+
+  if (consumedInput?.consumptionMode === "Variável na produção") {
+    return getProducedQuantityForConsumedUnit(material, consumedInput, lots);
   }
 
-  return lots.reduce((sum, lot) => sum + lot.outputSecondaryQuantity, 0);
+  return totalOutputQuantity * getInputQuantityPerProducedUnit(consumedInput);
+}
+
+function normalizeUnitName(unit) {
+  return String(unit || "").trim().toLowerCase();
+}
+
+function getProducedQuantityForConsumedUnit(material, consumedInput, lots) {
+  const consumedUnit = normalizeUnitName(consumedInput?.inputUnit || consumedInput?.unit);
+  const primaryUnit = normalizeUnitName(material?.unit || material?.primaryUnit);
+  const secondaryUnit = normalizeUnitName(material?.secondaryUnit);
+
+  if (consumedUnit && secondaryUnit && consumedUnit === secondaryUnit) {
+    return lots.reduce((sum, lot) => sum + Number(lot.outputSecondaryQuantity || 0), 0);
+  }
+
+  if (!consumedUnit || consumedUnit === primaryUnit) {
+    return lots.reduce((sum, lot) => sum + Number(lot.outputQuantity || 0), 0);
+  }
+
+  return null;
 }
 
 function getProducedTotalPrincipal() {
@@ -1374,11 +1629,22 @@ function getSelectedOperatorNames() {
 }
 
 function getGeneratedLotSuggestion(sequence) {
-  const prefix = getProductionLotPrefix();
+  const context = getProductionLotCodeContext();
 
-  if (!prefix) return "Gerado automaticamente";
+  if (!context) return "Gerado automaticamente";
 
-  return `${prefix}${String(sequence).padStart(2, "0")}`;
+  const existingLots = getExistingProductionLotCodes();
+
+  producedLots.slice(0, Math.max(Number(sequence) - 1, 0)).forEach((lot) => {
+    if (lot.lotCode) existingLots.push(lot.lotCode);
+  });
+
+  return generateProductionLotCode({
+    productionDate: context.productionDate,
+    materialLotCode: context.materialLotCode,
+    machineLotCode: context.machineLotCode,
+    existingLots
+  });
 }
 
 function openProductionConfirmModal(payload) {
@@ -1409,7 +1675,7 @@ function deletePendingProductionDraft() {
 }
 
 function renderProductionConfirmModal(payload) {
-  const { record, producedLots: lots, consumedInput, consumedLot } = payload;
+  const { record, producedLots: lots, consumedItems, lossCandidates = [], selectedLossIds = [] } = payload;
 
   return `
     <div class="modal large-modal movement-detail-modal">
@@ -1427,9 +1693,56 @@ function renderProductionConfirmModal(payload) {
         <div><small>Modelo</small><strong>${record.productionModelName || "-"}</strong></div>
         <div><small>Máquina</small><strong>${record.machineName || "-"}</strong></div>
         <div><small>Responsáveis</small><strong>${record.responsibleName || "-"}</strong></div>
-        <div><small>Lote consumido</small><strong>${consumedLot.lotCode || "-"}</strong></div>
-        <div><small>Consumo</small><strong>${formatNumber(payload.consumedQuantity)} ${consumedInput.inputUnit || ""}</strong></div>
       </div>
+
+      <div class="movement-detail-section production-confirm-consumed-lots">
+        <h3>Lotes consumidos</h3>
+        <div class="data-table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Material</th>
+                <th>Lote</th>
+                <th>Consumo</th>
+                <th>Saldo previsto</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${consumedItems.flatMap((item) => (item.allocations || []).map((allocation) => `
+                <tr>
+                  <td><strong>${item.consumedInput.inputMaterial}</strong></td>
+                  <td>${allocation.lotCode || "-"}</td>
+                  <td>${formatNumber(allocation.consumedQuantity)} ${item.consumedInput.inputUnit || ""}</td>
+                  <td>${formatNumber(allocation.remainingQuantity)} ${item.consumedInput.inputUnit || ""}</td>
+                </tr>
+              `)).join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      ${lossCandidates.length ? `
+        <div class="movement-detail-section production-loss-warning">
+          <h3>Possíveis perdas industriais</h3>
+          <p>Os lotes abaixo ficarão com saldo menor ou igual ao percentual configurado. Escolha quais saldos remanescentes devem ser baixados como perda rastreável.</p>
+          <div class="production-loss-list">
+            ${lossCandidates.map((loss) => `
+              <label class="production-loss-item">
+                <input
+                  class="production-loss-checkbox"
+                  type="checkbox"
+                  value="${loss.id}"
+                  ${selectedLossIds.includes(loss.id) ? "checked" : ""}
+                />
+                <span>
+                  <strong>${loss.lotCode}</strong>
+                  ${loss.inputMaterial} · saldo ${formatNumber(loss.remainingQuantity)} ${loss.inputUnit || ""} · ${formatPercent(loss.remainingPercent)} restante
+                </span>
+              </label>
+            `).join("")}
+          </div>
+        </div>
+      ` : ""}
 
       ${renderGeneratedLotsReadOnly(lots.map((lot) => ({
         lotCode: lot.lotCode,
@@ -1459,7 +1772,9 @@ function renderProductionConfirmModal(payload) {
 async function confirmProductionRegistration() {
   if (!pendingProductionPayload) return;
 
-  const { record, producedLots: lots, consumedInput, consumedLot, consumedQuantity } = pendingProductionPayload;
+  pendingProductionPayload.selectedLossIds = getSelectedLossesFromConfirmModal();
+
+  const { record, producedLots: lots, consumedItems, selectedLossIds = [] } = pendingProductionPayload;
 
   const savedProduction = await createProductionFromApi(pendingProductionPayload);
 
@@ -1499,25 +1814,38 @@ async function confirmProductionRegistration() {
     });
   });
 
-  lineStore.productionRecordItems.unshift({
-    id: crypto.randomUUID(),
-    productionRecordId: record.id,
-    inputMaterial: consumedInput.inputMaterial,
-    inputCode: consumedInput.inputCode,
-    inputUnit: consumedInput.inputUnit,
-    consumptionMode: consumedInput.consumptionMode,
-    requiredQuantity: consumedQuantity,
-    consumedLots: [
-      {
-        sourceLotId: consumedLot.id,
-        lotCode: consumedLot.lotCode,
-        locationName: consumedLot.locationName,
-        quantity: consumedQuantity
-      }
-    ],
-    sourceLocation: productionDraft.locationName,
-    notes: consumedInput.notes || ""
+  consumedItems.forEach((item) => {
+    lineStore.productionRecordItems.unshift({
+      id: crypto.randomUUID(),
+      productionRecordId: record.id,
+      inputMaterial: item.consumedInput.inputMaterial,
+      inputCode: item.consumedInput.inputCode,
+      inputUnit: item.consumedInput.inputUnit,
+      consumptionMode: item.consumedInput.consumptionMode,
+      requiredQuantity: item.consumedQuantity,
+      consumedLots: buildConsumedLotsWithLosses(item, selectedLossIds),
+      sourceLocation: productionDraft.locationName,
+      notes: item.consumedInput.notes || ""
+    });
   });
+
+  (pendingProductionPayload.lossCandidates || [])
+    .filter((loss) => selectedLossIds.includes(loss.id))
+    .forEach((loss) => {
+      lineStore.industrialLossEvents.unshift({
+        id: crypto.randomUUID(),
+        productionRecordId: record.id,
+        lotId: loss.lotId,
+        lotCode: loss.lotCode,
+        materialCode: loss.inputCode,
+        materialName: loss.inputMaterial,
+        quantity: loss.remainingQuantity,
+        unit: loss.inputUnit,
+        type: "INDUSTRIAL_LOSS",
+        createdAt: new Date().toISOString(),
+        notes: "Perda industrial registrada na confirmação da produção"
+      });
+    });
 
   pendingProductionPayload = null;
   closeProductionConfirmModal();
@@ -1587,13 +1915,13 @@ function updateProductionLimitSummary() {
   const summary = document.getElementById("productionLimitSummary");
   const material = getSelectedOutputMaterial();
   const model = getSelectedProductionModel();
-  const consumedInput = getModelConsumedInput(model);
-  const consumedLot = getSelectedConsumedLot();
+  const consumedInputs = getModelConsumedInputs(model);
+  const selectedConsumedLots = getSelectedConsumedLots();
 
-  if (!summary || !material || !consumedInput || !consumedLot) return;
+  if (!summary || !material || !consumedInputs.length || selectedConsumedLots.length !== consumedInputs.length) return;
 
   const next = document.createElement("div");
-  next.innerHTML = renderProductionLimitBox(material, consumedInput, consumedLot).trim();
+  next.innerHTML = renderProductionLimitBox(material, consumedInputs, selectedConsumedLots).trim();
   summary.replaceWith(next.firstElementChild);
 }
 
@@ -1748,6 +2076,8 @@ async function saveProductionEdit(recordId) {
       productionDate: draft.productionDate,
       materialId: material?.id || record.outputMaterialId || null,
       outputMaterialName: draft.outputMaterialName,
+      outputUnit: material?.unit || record.outputUnit || "",
+      outputSecondaryUnit: material?.secondaryUnit || record.outputSecondaryUnit || "",
       productionModelId: model?.id || record.productionModelId || null,
       productionModelName: draft.productionModelName,
       machineId: machine?.id || record.machineId || null,
@@ -2017,6 +2347,7 @@ function renderProductionRecordModal(record) {
       </div>
 
       ${renderConsumedLotsReadOnly(consumedItems)}
+      ${renderIndustrialLossesReadOnly(consumedItems)}
       ${renderGeneratedLotsReadOnly(generatedLots, record, "production-detail-output-lots")}
 
       ${isProductionEditMode ? renderProductionEditFields(record) : ""}
@@ -2159,6 +2490,13 @@ function setupProductionEditModalEvents(record) {
   document.querySelectorAll(".production-edit-output-lot-code, .production-edit-output-lot-secondary").forEach((input) => {
     input.addEventListener("input", captureProductionEditDraft);
   });
+}
+
+function isIndustrialLossLot(lot) {
+  return Boolean(lot?.isIndustrialLoss) ||
+    lot?.eventType === "INDUSTRIAL_LOSS" ||
+    lot?.type === "INDUSTRIAL_LOSS" ||
+    lot?.status === "INDUSTRIAL_LOSS";
 }
 
 function getProductionEditModel() {
@@ -2353,7 +2691,12 @@ function renderProductionEditFields(record) {
 }
 
 function renderConsumedLotsReadOnly(items) {
-  if (!items.length) {
+  const productiveItems = items.map((item) => ({
+    ...item,
+    consumedLots: (item.consumedLots || []).filter((lot) => !isIndustrialLossLot(lot))
+  })).filter((item) => item.consumedLots.length);
+
+  if (!productiveItems.length) {
     return `<div class="production-preview-empty compact-production-empty">Nenhum lote consumido registrado.</div>`;
   }
 
@@ -2371,13 +2714,54 @@ function renderConsumedLotsReadOnly(items) {
             </tr>
           </thead>
           <tbody>
-            ${items.flatMap((item) => {
+            ${productiveItems.flatMap((item) => {
               return (item.consumedLots || []).map((lot) => `
                 <tr>
                   <td>${item.inputMaterial}</td>
                   <td><strong>${item.inputCode || "-"}</strong></td>
                   <td>${lot.lotCode || "-"}</td>
                   <td>${formatNumber(lot.quantity)} ${item.inputUnit || ""}</td>
+                </tr>
+              `);
+            }).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderIndustrialLossesReadOnly(items) {
+  const lossItems = items.map((item) => ({
+    ...item,
+    consumedLots: (item.consumedLots || []).filter(isIndustrialLossLot)
+  })).filter((item) => item.consumedLots.length);
+
+  if (!lossItems.length) return "";
+
+  return `
+    <div class="movement-detail-section production-industrial-loss-section">
+      <h3>Perdas industriais</h3>
+      <div class="data-table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Material</th>
+              <th>CÓDIGO</th>
+              <th>Lote</th>
+              <th>Quantidade</th>
+              <th>Tipo</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${lossItems.flatMap((item) => {
+              return (item.consumedLots || []).map((lot) => `
+                <tr>
+                  <td>${item.inputMaterial}</td>
+                  <td><strong>${item.inputCode || "-"}</strong></td>
+                  <td>${lot.lotCode || "-"}</td>
+                  <td>${formatNumber(lot.quantity)} ${item.inputUnit || ""}</td>
+                  <td><span class="badge production-industrial-loss-badge">Perda industrial</span></td>
                 </tr>
               `);
             }).join("")}
@@ -2447,18 +2831,20 @@ async function loadProductionPageFromApi(force = false) {
 
 async function loadProductionReferencesFromApi() {
   try {
-    const [materials, locations, machines, operators, stock] = await Promise.all([
+    const [materials, locations, machines, operators, stock, stockLossParameters] = await Promise.all([
       apiGet("/api/materials"),
       apiGet("/api/locations"),
       apiGet("/api/machines"),
       apiGet("/api/operators"),
-      apiGet("/api/stock")
+      apiGet("/api/stock"),
+      apiGet("/api/stock-loss-parameters")
     ]);
 
     lineStore.materials.splice(0, lineStore.materials.length, ...materials.map(normalizeApiMaterial).filter(isActiveItem));
     lineStore.locations.splice(0, lineStore.locations.length, ...locations.map(normalizeApiLocation).filter(isActiveItem));
     lineStore.machines.splice(0, lineStore.machines.length, ...machines.map(normalizeApiMachine).filter(isActiveItem));
     lineStore.operators.splice(0, lineStore.operators.length, ...operators.map(normalizeApiOperator).filter(isActiveItem));
+    saveStockLossParameters(stockLossParameters);
     apiStockSnapshot = normalizeApiStockSnapshot(stock);
   } catch (error) {
     if (!shouldUseLocalFallback(error)) {
@@ -2509,7 +2895,7 @@ async function reloadProductionFromApi() {
 }
 
 async function createProductionFromApi(payload) {
-  const { record, producedLots: lots, consumedInput, consumedLot, consumedQuantity } = payload;
+  const { record, producedLots: lots, consumedItems, selectedLossIds = [] } = payload;
   const material = getSelectedOutputMaterial();
   const model = getSelectedProductionModel();
   const machine = getSelectedProductionMachine();
@@ -2519,18 +2905,27 @@ async function createProductionFromApi(payload) {
       productionDate: record.productionDate,
       materialId: material?.id || null,
       outputMaterialName: record.outputMaterialName,
+      outputUnit: material?.unit || record.outputUnit || "",
+      outputSecondaryUnit: material?.secondaryUnit || record.outputSecondaryUnit || "",
       productionModelId: model?.id || null,
       productionModelName: record.productionModelName,
       machineId: machine?.id || null,
       machineName: record.machineName,
       locationName: record.locationName,
       operatorCodes: record.responsibleCodes || [],
-      consumedQuantity,
-      consumedLot: {
-        lotId: consumedLot.lotId || consumedLot.id,
-        lotCode: consumedLot.lotCode,
-        quantity: consumedQuantity
-      },
+      consumedLots: consumedItems.flatMap((item) => {
+        return buildConsumedLotsWithLosses(item, selectedLossIds).map((lot) => ({
+          lotId: lot.lotId || lot.sourceLotId,
+          lotCode: lot.lotCode,
+          materialCode: item.consumedInput.inputCode,
+          materialName: item.consumedInput.inputMaterial,
+          quantity: lot.quantity,
+          secondaryQuantity: lot.secondaryQuantity,
+          eventType: lot.eventType,
+          isIndustrialLoss: Boolean(lot.isIndustrialLoss),
+          notes: lot.notes
+        }));
+      }),
       outputLots: lots.map((lot) => ({
         lotCode: lot.lotCode,
         quantity: lot.outputQuantity,
@@ -2652,7 +3047,8 @@ function normalizeApiStockSnapshot(snapshot) {
       lotCode: lot.lotCode || "",
       quantity: Number(lot.quantity || 0),
       secondaryQuantity: Number(lot.secondaryQuantity || 0),
-      availableQuantity: Number(lot.availableQuantity ?? lot.quantity ?? 0)
+      availableQuantity: Number(lot.availableQuantity ?? lot.quantity ?? 0),
+      productionDate: lot.productionDate || lot.createdAt || ""
     })) : []
   };
 }
@@ -2684,6 +3080,13 @@ function formatNumber(value) {
     minimumFractionDigits: 0,
     maximumFractionDigits: 3
   });
+}
+
+function formatPercent(value) {
+  return `${Number(value || 0).toLocaleString("pt-BR", {
+    minimumFractionDigits: 1,
+    maximumFractionDigits: 1
+  })}%`;
 }
 
 function formatDateTime(value) {

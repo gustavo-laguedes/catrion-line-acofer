@@ -345,7 +345,8 @@ export function renderSaleDraftLots(item, index, stockExitMode = "FIFO") {
                           itemIndex: index,
                           lotIndex,
                           primaryQuantity: lot.exitQuantity || 0,
-                          inputClass: "sale-lot-secondary-quantity"
+                          inputClass: "sale-lot-secondary-quantity",
+                          disabled: isFifo || lot.exitMode === "TOTAL"
                         })}
                       </div>
                     `;

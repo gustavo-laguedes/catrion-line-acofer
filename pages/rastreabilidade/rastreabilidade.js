@@ -18,6 +18,7 @@ let traceabilityError = "";
 let referencesLoaded = false;
 let hasSearchedTraceability = false;
 let advancedFiltersOpen = true;
+let traceabilityTreeResizeHandlerBound = false;
 
 let referenceData = {
   materials: [],
@@ -26,7 +27,7 @@ let referenceData = {
 };
 
 export const rastreabilidadePage = {
-  title: "🔎 Rastreabilidade",
+  title: "Rastreabilidade",
   subtitle: "Linha do tempo completa dos lotes, da origem ao destino",
   render: renderRastreabilidade,
   afterRender: setupRastreabilidadeEvents
@@ -39,12 +40,18 @@ function renderRastreabilidade() {
         <div class="traceability-search-header">
           <div>
             <h2>Rastrear lote</h2>
-            <p>Busque por lote, codigo ou material e acompanhe a historia industrial completa.</p>
+            <p>Busque por lote, código ou material e acompanhe a história industrial completa.</p>
           </div>
 
-          <button id="toggleTraceabilityFilters" class="secondary-btn" type="button">
-            ${advancedFiltersOpen ? "Ocultar filtros" : "Filtros avancados"}
-          </button>
+          <div class="traceability-header-actions">
+            <button id="clearTraceabilityFilters" class="secondary-btn" type="button">
+              Limpar filtros
+            </button>
+
+            <button id="toggleTraceabilityFilters" class="secondary-btn" type="button">
+              ${advancedFiltersOpen ? "Ocultar filtros" : "Filtros avançados"}
+            </button>
+          </div>
         </div>
 
         <div class="traceability-main-search">
@@ -52,7 +59,7 @@ function renderRastreabilidade() {
             id="traceabilitySearchInput"
             type="text"
             value="${escapeHtml(traceabilityFilters.q)}"
-            placeholder="Digite o lote, codigo ou material"
+            placeholder="Digite o lote, código ou material"
           />
 
           <button id="traceabilitySearchBtn" class="primary-btn" type="button">
@@ -64,7 +71,7 @@ function renderRastreabilidade() {
 
         ${traceabilityError ? `
           <div class="traceability-alert">
-            <strong>Rastreabilidade indisponivel</strong>
+            <strong>Rastreabilidade indisponível</strong>
             <span>${escapeHtml(traceabilityError)}</span>
           </div>
         ` : ""}
@@ -83,9 +90,11 @@ function renderRastreabilidade() {
         </div>
 
         <div class="traceability-detail-wrap">
-          ${renderDetailPanel()}
+          ${renderDetailPanelV2()}
         </div>
       </div>
+
+      ${renderTreePanel()}
     </div>
   `;
 }
@@ -127,7 +136,7 @@ function renderAdvancedFilters() {
         Status
         <select id="traceabilityStatusFilter">
           ${renderSelectOptions([
-            { value: "Disponivel", label: "Disponivel" },
+            { value: "Disponivel", label: "Disponível" },
             { value: "Sem saldo", label: "Sem saldo" },
             { value: "Cancelado", label: "Cancelado" },
             { value: "Reprocessado", label: "Reprocessado" }
@@ -136,12 +145,12 @@ function renderAdvancedFilters() {
       </label>
 
       <label>
-        Periodo inicial
+        Período inicial
         <input id="traceabilityFromFilter" type="date" value="${traceabilityFilters.from}" />
       </label>
 
       <label>
-        Periodo final
+        Período final
         <input id="traceabilityToFilter" type="date" value="${traceabilityFilters.to}" />
       </label>
     </div>
@@ -161,9 +170,9 @@ function renderResultsPanel() {
   if (!traceabilityResults.length && !hasAnyFilter()) {
     return `
       <div class="empty-state small-empty">
-        <div class="empty-icon">🔎</div>
+        <div class="empty-icon">R</div>
         <h3>Comece por uma busca</h3>
-        <p>Informe lote, codigo ou material para abrir a rastreabilidade industrial.</p>
+        <p>Informe lote, código ou material para abrir a rastreabilidade industrial.</p>
       </div>
     `;
   }
@@ -173,7 +182,7 @@ function renderResultsPanel() {
       <div class="empty-state small-empty">
         <div class="empty-icon">0</div>
         <h3>Nenhum lote encontrado</h3>
-        <p>Ajuste os filtros ou tente buscar pelo codigo exato do lote.</p>
+        <p>Ajuste os filtros ou tente buscar pelo código exato do lote.</p>
       </div>
     `;
   }
@@ -240,7 +249,7 @@ function renderDetailPanel() {
     <div class="card traceability-detail-card ${getLotCardClass(lot.status)}">
       <div class="traceability-lot-hero">
         <div>
-          <span class="traceability-kicker">${escapeHtml(lot.originLabel || "Origem nao informada")}</span>
+          <span class="traceability-kicker">${escapeHtml(lot.originLabel || "Origem não informada")}</span>
           <h2>${escapeHtml(lot.lotCode || "-")}</h2>
           <p>${escapeHtml(lot.materialName || "-")} · ${escapeHtml(lot.materialType || "Sem tipo")}</p>
         </div>
@@ -252,7 +261,7 @@ function renderDetailPanel() {
 
       ${lot.notes ? `
         <div class="movement-detail-note">
-          <strong>Observacoes:</strong> ${escapeHtml(lot.notes)}
+          <strong>Observações:</strong> ${escapeHtml(lot.notes)}
         </div>
       ` : ""}
 
@@ -260,24 +269,94 @@ function renderDetailPanel() {
       ${renderRelations(detail.parents || [], detail.children || [])}
       ${renderProductions(detail.productionsAsInput || [], detail.productionsAsOutput || [])}
       ${renderMovements(detail.movements || [])}
+      ${renderIndustrialTree(detail)}
     </div>
   `;
+}
+
+function renderDetailPanelV2() {
+  if (detailLoading) {
+    return `
+      <div class="card traceability-detail-card">
+        <div class="traceability-loading detail">
+          <div class="traceability-spinner"></div>
+          <strong>Montando linha do tempo...</strong>
+        </div>
+      </div>
+    `;
+  }
+
+  if (!selectedTraceability) {
+    return `
+      <div class="card traceability-detail-card">
+        <div class="empty-state">
+          <div class="empty-icon">R</div>
+          <h3>Nenhum lote selecionado</h3>
+          <p>Selecione um lote na lista para ver origem, consumo, eventos, produções e derivações.</p>
+        </div>
+      </div>
+    `;
+  }
+
+  const detail = selectedTraceability;
+  const lot = detail.lot || {};
+  const balance = detail.currentBalance || {};
+
+  return `
+    <div class="traceability-detail-stack">
+      <div class="card traceability-detail-card traceability-detail-block ${getLotCardClass(lot.status)}">
+        <div class="traceability-lot-hero">
+          <div>
+            <span class="traceability-kicker">${escapeHtml(lot.originLabel || "Origem não informada")}</span>
+            <h2>${escapeHtml(lot.lotCode || "-")}</h2>
+            <p>${escapeHtml(lot.materialName || "-")} · ${escapeHtml(lot.materialType || "Sem tipo")}</p>
+          </div>
+
+          <span class="badge ${getStatusBadgeClass(lot.status)}">${escapeHtml(normalizeStatus(lot.status))}</span>
+        </div>
+
+        ${renderLotMetrics(detail, balance)}
+        ${renderLaboratoryCertificates(detail.laboratoryCertificates || [])}
+
+        ${lot.notes ? `
+          <div class="movement-detail-note">
+            <strong>Observações:</strong> ${escapeHtml(lot.notes)}
+          </div>
+        ` : ""}
+
+        ${renderTimeline(detail.timeline || [])}
+      </div>
+
+      <div class="card traceability-detail-card traceability-detail-block">
+        ${renderProductions(detail.productionsAsInput || [], detail.productionsAsOutput || [])}
+        ${renderMovements(detail.movements || [])}
+      </div>
+    </div>
+  `;
+}
+
+function renderTreePanel() {
+  if (detailLoading || !selectedTraceability) return "";
+  return renderIndustrialTree(selectedTraceability);
 }
 
 function renderLotMetrics(detail, balance) {
   const lot = detail.lot || {};
   const location = detail.location || {};
+  const consumed = getTotalConsumed(detail.productionsAsInput || []);
+  const primaryUnit = consumed.unit || balance.unit || lot.unit || "";
+  const secondaryUnit = consumed.secondaryUnit || balance.secondaryUnit || lot.secondaryUnit || "";
 
   return `
     <div class="movement-detail-grid traceability-metrics">
       <div>
-        <small>Saldo principal</small>
-        <strong>${formatNumber(balance.quantity)} ${escapeHtml(balance.unit || lot.unit || "")}</strong>
+        <small>Total consumido principal</small>
+        <strong>${formatNumber(consumed.quantity)} ${escapeHtml(primaryUnit)}</strong>
       </div>
 
       <div>
-        <small>Saldo secundario</small>
-        <strong>${balance.secondaryUnit || lot.secondaryUnit ? `${formatNumber(balance.secondaryQuantity)} ${escapeHtml(balance.secondaryUnit || lot.secondaryUnit || "")}` : "-"}</strong>
+        <small>Total consumido secundario</small>
+        <strong>${secondaryUnit ? `${formatNumber(consumed.secondaryQuantity)} ${escapeHtml(secondaryUnit)}` : "-"}</strong>
       </div>
 
       <div>
@@ -303,6 +382,32 @@ function renderLotMetrics(detail, balance) {
   `;
 }
 
+function renderLaboratoryCertificates(certificates) {
+  return `
+    <div class="movement-detail-section">
+      <h3>Certificados laboratoriais</h3>
+      ${
+        certificates.length
+          ? `
+            <div class="traceability-certificates-list">
+              ${certificates.map((certificate) => `
+                <div class="traceability-certificate-item">
+                  <div>
+                    <strong>${escapeHtml(certificate.certificateCode || "-")}</strong>
+                    <span>${escapeHtml(certificate.certificateFileName || "Certificado sem arquivo")}</span>
+                  </div>
+                  <span>${formatDate(certificate.testDate)}</span>
+                  <span class="badge ${getStatusBadgeClass(certificate.status)}">${escapeHtml(normalizeStatus(certificate.status))}</span>
+                </div>
+              `).join("")}
+            </div>
+          `
+          : `<div class="production-preview-empty compact-production-empty">Nenhum certificado laboratorial direto registrado para este lote.</div>`
+      }
+    </div>
+  `;
+}
+
 function renderTimeline(timeline) {
   return `
     <div class="movement-detail-section">
@@ -312,12 +417,12 @@ function renderTimeline(timeline) {
         timeline.length
           ? `
             <div class="traceability-timeline">
-              ${timeline.map(renderTimelineItem).join("")}
+              ${timeline.map((item, index) => renderTimelineItem({ ...item, icon: `#${index + 1}` }, index)).join("")}
             </div>
           `
           : `
             <div class="production-preview-empty compact-production-empty">
-              Nenhum evento registrado para este lote. O cadastro base ainda permanece visivel para auditoria.
+              Nenhum evento registrado para este lote. O cadastro base ainda permanece visível para auditoria.
             </div>
           `
       }
@@ -325,7 +430,7 @@ function renderTimeline(timeline) {
   `;
 }
 
-function renderTimelineItem(item) {
+function renderTimelineItem(item, index) {
   return `
     <div class="traceability-timeline-item ${getTimelineClass(item.type)}">
       <div class="traceability-timeline-marker">
@@ -346,11 +451,28 @@ function renderTimelineItem(item) {
 
         <div class="traceability-timeline-meta">
           ${item.locationName ? `<span>${escapeHtml(item.locationName)}</span>` : ""}
-          ${item.quantity ? `<span>${formatSignedNumber(item.quantity)}</span>` : ""}
-          ${item.secondaryQuantity ? `<span>Sec.: ${formatSignedNumber(item.secondaryQuantity)}</span>` : ""}
+          ${item.quantity ? `<span>${formatSignedQuantity(item.quantity, item.unit)}</span>` : ""}
+          ${item.secondaryQuantity ? `<span>Sec.: ${formatSignedQuantity(item.secondaryQuantity, item.secondaryUnit)}</span>` : ""}
           ${item.status ? `<span>${escapeHtml(normalizeStatus(item.status))}</span>` : ""}
         </div>
+
+        ${renderTimelineChildLots(item.childLots || [])}
       </div>
+    </div>
+  `;
+}
+
+function renderTimelineChildLots(childLots) {
+  if (!childLots.length) return "";
+
+  return `
+    <div class="traceability-timeline-lots">
+      ${childLots.map((lot) => `
+        <button class="traceability-timeline-lot" data-traceability-lot-id="${lot.lotId}" type="button">
+          <strong>${escapeHtml(lot.lotCode || "-")}</strong>
+          <span>${formatQuantityWithSecondary(lot.quantity, lot.unit, lot.secondaryQuantity, lot.secondaryUnit)}</span>
+        </button>
+      `).join("")}
     </div>
   `;
 }
@@ -358,7 +480,7 @@ function renderTimelineItem(item) {
 function renderRelations(parents, children) {
   return `
     <div class="movement-detail-section">
-      <h3>Relacoes entre lotes</h3>
+      <h3>Relações entre lotes</h3>
 
       <div class="traceability-relations-grid">
         ${renderRelationGroup("Lotes pais/origem", parents)}
@@ -387,10 +509,215 @@ function renderRelationGroup(title, lots) {
                 <span class="badge ${getStatusBadgeClass(lot.status)}">${escapeHtml(normalizeStatus(lot.status))}</span>
               </button>
             `).join("")
-          : `<div class="production-preview-empty compact-production-empty">Nenhum vinculo registrado.</div>`
+          : `<div class="production-preview-empty compact-production-empty">Nenhum vínculo registrado.</div>`
       }
     </div>
   `;
+}
+
+function renderIndustrialTree(detail) {
+  const lot = detail.lot || {};
+  const tree = detail.industrialTree || {};
+  const levels = Array.isArray(tree.levels) && tree.levels.length
+    ? tree.levels
+    : buildFallbackTreeLevels(detail, lot);
+  const flowColumns = levels.map((level) => ({
+    type: level.type === "ancestor" ? "origin" : level.type === "descendant" ? "derived" : "current",
+    title: level.title,
+    count: level.count,
+    countLabel: level.countLabel,
+    lots: Array.isArray(level.lots) ? level.lots : [],
+    depth: level.depth || 0
+  }));
+  const totalLots = flowColumns.reduce((total, column) => total + column.lots.length, 0);
+  const edges = normalizeIndustrialTreeEdges(tree.edges || []);
+  const treeSizeClass = flowColumns.length <= 2 && totalLots <= 3
+    ? " roomy"
+    : flowColumns.length <= 3 && totalLots <= 6
+      ? " spacious"
+      : flowColumns.length >= 4
+      ? " dense"
+      : "";
+
+  return `
+    <div class="card traceability-tree-card">
+      <h3>Árvore industrial do lote</h3>
+
+      <div class="traceability-tree-scroll">
+        <div class="traceability-tree-stage">
+          <svg class="traceability-tree-edges" aria-hidden="true"></svg>
+          <div
+            class="traceability-tree${treeSizeClass}"
+            data-tree-edges="${escapeHtml(JSON.stringify(edges))}"
+            style="--tree-columns: ${flowColumns.length}; --tree-lots: ${totalLots}"
+          >
+            ${flowColumns.map((column) => renderIndustrialTreeColumn(column)).join("")}
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderIndustrialTreeColumn(column) {
+  const countLabel = column.countLabel || `${column.count || 0} lote(s)`;
+  const depth = column.depth || 0;
+  const absoluteDepth = Math.abs(depth);
+  const depthClass = absoluteDepth >= 3 ? " deep" : absoluteDepth >= 2 ? " medium" : "";
+  const typeClass = `traceability-tree-${column.type}`;
+
+  return `
+    <div class="traceability-tree-level ${typeClass}${depthClass}" style="--tree-depth: ${Math.min(absoluteDepth, 4)}">
+      <div class="traceability-section-title">
+        <strong>${escapeHtml(column.title)}</strong>
+        <span>${escapeHtml(countLabel)}</span>
+      </div>
+
+      ${column.lots.length
+        ? `<div class="traceability-tree-lots">${column.lots.map((item) => renderTreeLotCard(item, column.type === "current")).join("")}</div>`
+        : ""}
+    </div>
+  `;
+}
+
+function buildFallbackTreeLevels(detail, lot) {
+  const parents = detail.parents || [];
+  const children = detail.children || [];
+  const derivedLevels = buildDerivedTreeLevels(lot, children);
+
+  return [
+    ...(parents.length ? [{
+      type: "ancestor",
+      title: "Pais/origem",
+      count: parents.length,
+      depth: 1,
+      lots: parents
+    }] : []),
+    {
+      type: "current",
+      title: "Lote selecionado",
+      countLabel: "Selecionado",
+      depth: 0,
+      lots: [lot]
+    },
+    ...derivedLevels.map((level, index) => ({
+      type: "descendant",
+      title: index === 0 ? "Filhos/derivados" : `Derivados nivel ${index + 1}`,
+      count: level.length,
+      lots: level,
+      depth: index + 1
+    }))
+  ];
+}
+
+function buildDerivedTreeLevels(currentLot, children) {
+  if (!children.length) return [];
+
+  const levels = [];
+  const visited = new Set([String(currentLot.id || currentLot.lotId || "")].filter(Boolean));
+  const hasParentReference = children.some((child) => getTreeParentId(child));
+
+  if (hasParentReference) {
+    const byParentId = children.reduce((map, child) => {
+      const parentId = getTreeParentId(child);
+      if (!parentId) return map;
+      const siblings = map.get(parentId) || [];
+      siblings.push(child);
+      map.set(parentId, siblings);
+      return map;
+    }, new Map());
+
+    let currentIds = [String(currentLot.id || currentLot.lotId || "")].filter(Boolean);
+
+    while (currentIds.length) {
+      const linkedLevel = currentIds.flatMap((id) => byParentId.get(id) || []);
+      const levelSource = !levels.length && !linkedLevel.length
+        ? children.filter((child) => !getTreeParentId(child))
+        : linkedLevel;
+      const level = levelSource
+        .filter((child) => {
+          const childId = getTreeLotId(child);
+          if (!childId || visited.has(childId)) return false;
+          visited.add(childId);
+          return true;
+        });
+
+      if (!level.length) break;
+      levels.push(level);
+      currentIds = level.map(getTreeLotId).filter(Boolean);
+    }
+
+    return levels;
+  }
+
+  let currentLevel = children;
+
+  while (currentLevel.length) {
+    const level = currentLevel.filter((child) => {
+      const childId = getTreeLotId(child);
+      if (!childId) return true;
+      if (visited.has(childId)) return false;
+      visited.add(childId);
+      return true;
+    });
+
+    if (!level.length) break;
+    levels.push(level);
+    currentLevel = level.flatMap(getNestedTreeChildren);
+  }
+
+  return levels;
+}
+
+function getNestedTreeChildren(lot) {
+  return ["children", "childLots", "derivedLots", "descendants"].flatMap((key) => (
+    Array.isArray(lot?.[key]) ? lot[key] : []
+  ));
+}
+
+function getTreeLotId(lot) {
+  const id = lot?.lotId || lot?.id || lot?.childLotId;
+  return id ? String(id) : "";
+}
+
+function getTreeParentId(lot) {
+  const id = lot?.parentLotId || lot?.parentId || lot?.parent_lot_id;
+  return id ? String(id) : "";
+}
+
+function renderTreeLotCard(lot, isCurrent = false) {
+  const lotId = lot.lotId || lot.id;
+  return `
+    <button class="traceability-tree-lot${isCurrent ? " current" : ""}" data-traceability-lot-id="${escapeHtml(lotId || "")}" data-tree-node-id="${escapeHtml(lotId || "")}" type="button">
+      <div>
+        <strong>${escapeHtml(lot.lotCode || "-")}</strong>
+        <span>${escapeHtml(lot.materialName || "-")}</span>
+        ${renderTreeLotQuantities(lot)}
+      </div>
+      <span class="badge ${getStatusBadgeClass(lot.status)}">${escapeHtml(normalizeStatus(lot.status))}</span>
+    </button>
+  `;
+}
+
+function renderTreeLotQuantities(lot) {
+  const hasPrimaryQuantity = lot.quantity !== null && lot.quantity !== undefined && lot.quantity !== "";
+  const hasSecondaryQuantity = lot.secondaryQuantity !== null && lot.secondaryQuantity !== undefined && lot.secondaryQuantity !== "";
+  if (!hasPrimaryQuantity && !hasSecondaryQuantity) return "";
+
+  return `
+    <div class="traceability-tree-qty">
+      ${hasPrimaryQuantity ? `
+        <span><small>Qtd</small><strong>${formatNumber(lot.quantity)} ${escapeHtml(lot.unit || "")}</strong></span>
+      ` : ""}
+      ${hasSecondaryQuantity ? `
+        <span><small>Peso</small><strong>${formatNumber(lot.secondaryQuantity)} ${escapeHtml(lot.secondaryUnit || "")}</strong></span>
+      ` : ""}
+    </div>
+  `;
+}
+
+function renderCurrentTreeLotCard(lot) {
+  return renderTreeLotCard(lot, true);
 }
 
 function renderProductions(asInput, asOutput) {
@@ -401,7 +728,7 @@ function renderProductions(asInput, asOutput) {
 
   return `
     <div class="movement-detail-section">
-      <h3>Producao relacionada</h3>
+      <h3>Produção relacionada</h3>
 
       ${
         productions.length
@@ -410,7 +737,7 @@ function renderProductions(asInput, asOutput) {
               ${productions.map(renderProductionCard).join("")}
             </div>
           `
-          : `<div class="production-preview-empty compact-production-empty">Nenhuma producao relacionada.</div>`
+          : `<div class="production-preview-empty compact-production-empty">Nenhuma produção relacionada.</div>`
       }
     </div>
   `;
@@ -429,10 +756,11 @@ function renderProductionCard(production) {
       </div>
 
       <div class="traceability-production-meta">
-        <span>Maquina: <strong>${escapeHtml(production.machineName || "-")}</strong></span>
+        <span>Máquina: <strong>${escapeHtml(production.machineName || "-")}</strong></span>
         <span>Operadores: <strong>${escapeHtml(production.operatorNames || "-")}</strong></span>
         <span>Local: <strong>${escapeHtml(production.locationName || "-")}</strong></span>
         <span>Qtd.: <strong>${formatNumber(production.quantity)} ${escapeHtml(production.unit || "")}</strong></span>
+        ${production.secondaryQuantity ? `<span>Sec.: <strong>${formatNumber(production.secondaryQuantity)} ${escapeHtml(production.secondaryUnit || "")}</strong></span>` : ""}
       </div>
     </div>
   `;
@@ -441,7 +769,7 @@ function renderProductionCard(production) {
 function renderMovements(movements) {
   return `
     <div class="movement-detail-section">
-      <h3>Movimentacoes relacionadas</h3>
+      <h3>Movimentações relacionadas</h3>
 
       ${
         movements.length
@@ -465,7 +793,10 @@ function renderMovements(movements) {
                       <td><strong>${escapeHtml(movement.typeLabel || movement.movementType || "-")}</strong></td>
                       <td>${escapeHtml(movement.documentNumber || "-")}</td>
                       <td>${escapeHtml(movement.locationName || "-")}</td>
-                      <td>${formatNumber(movement.quantity)} ${escapeHtml(movement.unit || "")}</td>
+                      <td>
+                        ${formatNumber(movement.quantity)} ${escapeHtml(movement.unit || "")}
+                        ${movement.secondaryQuantity ? `<small class="traceability-secondary-quantity">Sec.: ${formatNumber(movement.secondaryQuantity)} ${escapeHtml(movement.secondaryUnit || "")}</small>` : ""}
+                      </td>
                       <td><span class="badge ${getStatusBadgeClass(movement.status)}">${escapeHtml(normalizeStatus(movement.status))}</span></td>
                     </tr>
                   `).join("")}
@@ -473,7 +804,7 @@ function renderMovements(movements) {
               </table>
             </div>
           `
-          : `<div class="production-preview-empty compact-production-empty">Nenhuma movimentacao relacionada.</div>`
+          : `<div class="production-preview-empty compact-production-empty">Nenhuma movimentação relacionada.</div>`
       }
     </div>
   `;
@@ -491,6 +822,8 @@ function setupRastreabilidadeEvents(options = {}) {
   });
 
   document.getElementById("traceabilitySearchBtn")?.addEventListener("click", runTraceabilitySearch);
+
+  document.getElementById("clearTraceabilityFilters")?.addEventListener("click", clearTraceabilityFilters);
 
   document.getElementById("toggleTraceabilityFilters")?.addEventListener("click", () => {
     advancedFiltersOpen = !advancedFiltersOpen;
@@ -512,6 +845,9 @@ function setupRastreabilidadeEvents(options = {}) {
     runTraceabilitySearch();
   }
 
+  bindTraceabilityTreeResizeHandler();
+  drawTraceabilityTreeEdges();
+
   return loadPromise;
 }
 
@@ -520,6 +856,20 @@ function bindFilter(id, field) {
     traceabilityFilters[field] = event.target.value;
     runTraceabilitySearch();
   });
+}
+
+function clearTraceabilityFilters() {
+  traceabilityFilters = {
+    q: "",
+    materialId: "",
+    typeId: "",
+    locationId: "",
+    status: "",
+    from: "",
+    to: ""
+  };
+
+  runTraceabilitySearch();
 }
 
 async function loadTraceabilityReferences(force = false) {
@@ -542,7 +892,7 @@ async function loadTraceabilityReferences(force = false) {
 
     refreshTraceabilityPage();
   } catch (error) {
-    traceabilityError = "Nao foi possivel carregar materiais, tipos e locais para os filtros.";
+    traceabilityError = "Não foi possível carregar materiais, tipos e locais para os filtros.";
     refreshTraceabilityPage();
   }
 }
@@ -595,11 +945,25 @@ async function loadTraceabilityDetail(lotId, shouldRefreshLoading = true) {
     selectedTraceability = await apiGet(`/api/traceability/lots/${lotId}`);
   } catch (error) {
     selectedTraceability = null;
-    traceabilityError = error?.data?.error || error?.message || "Nao foi possivel carregar o lote.";
+    traceabilityError = error?.data?.error || error?.message || "Não foi possível carregar o lote.";
   } finally {
     detailLoading = false;
     refreshTraceabilityPage();
+    centerSelectedTraceabilityTreeLot();
   }
+}
+
+function centerSelectedTraceabilityTreeLot() {
+  window.requestAnimationFrame(() => {
+    const currentLot = document.querySelector(".traceability-tree-lot.current");
+    const treeScroll = document.querySelector(".traceability-tree-scroll");
+    if (!currentLot || !treeScroll) return;
+
+    const lotBox = currentLot.getBoundingClientRect();
+    const scrollBox = treeScroll.getBoundingClientRect();
+    const offset = lotBox.left - scrollBox.left - (scrollBox.width / 2) + (lotBox.width / 2);
+    treeScroll.scrollLeft += offset;
+  });
 }
 
 function refreshTraceabilityPage() {
@@ -618,6 +982,87 @@ function refreshTraceabilityPage() {
   setupRastreabilidadeEvents();
 }
 
+function normalizeIndustrialTreeEdges(edges) {
+  const seen = new Set();
+
+  return edges
+    .map((edge) => ({
+      id: edge.id || `${edge.fromLotId || edge.parentLotId}-${edge.toLotId || edge.childLotId}-${edge.productionId || ""}`,
+      fromLotId: String(edge.fromLotId || edge.parentLotId || ""),
+      toLotId: String(edge.toLotId || edge.childLotId || ""),
+      productionId: edge.productionId || ""
+    }))
+    .filter((edge) => {
+      if (!edge.fromLotId || !edge.toLotId) return false;
+      const key = `${edge.fromLotId}:${edge.toLotId}:${edge.productionId}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function bindTraceabilityTreeResizeHandler() {
+  if (traceabilityTreeResizeHandlerBound) return;
+  traceabilityTreeResizeHandlerBound = true;
+  window.addEventListener("resize", () => drawTraceabilityTreeEdges());
+}
+
+function drawTraceabilityTreeEdges() {
+  window.requestAnimationFrame(() => {
+    const stage = document.querySelector(".traceability-tree-stage");
+    const tree = document.querySelector(".traceability-tree");
+    const svg = document.querySelector(".traceability-tree-edges");
+    if (!stage || !tree || !svg) return;
+
+    let edges = [];
+    try {
+      edges = JSON.parse(tree.dataset.treeEdges || "[]");
+    } catch {
+      edges = [];
+    }
+
+    const stageRect = stage.getBoundingClientRect();
+    const width = Math.max(stage.scrollWidth, stageRect.width);
+    const height = Math.max(stage.scrollHeight, stageRect.height);
+    svg.setAttribute("width", String(width));
+    svg.setAttribute("height", String(height));
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.innerHTML = `
+      <defs>
+        <marker id="traceabilityTreeArrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z"></path>
+        </marker>
+      </defs>
+    `;
+
+    edges.forEach((edge) => {
+      const from = stage.querySelector(`[data-tree-node-id="${cssEscape(edge.fromLotId)}"]`);
+      const to = stage.querySelector(`[data-tree-node-id="${cssEscape(edge.toLotId)}"]`);
+      if (!from || !to) return;
+
+      const fromRect = from.getBoundingClientRect();
+      const toRect = to.getBoundingClientRect();
+      const startX = fromRect.right - stageRect.left + stage.scrollLeft;
+      const startY = fromRect.top - stageRect.top + stage.scrollTop + (fromRect.height / 2);
+      const endX = toRect.left - stageRect.left + stage.scrollLeft;
+      const endY = toRect.top - stageRect.top + stage.scrollTop + (toRect.height / 2);
+      const distance = Math.max(42, Math.abs(endX - startX));
+      const curve = Math.min(120, distance * 0.48);
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+
+      path.setAttribute("d", `M ${startX} ${startY} C ${startX + curve} ${startY}, ${endX - curve} ${endY}, ${endX} ${endY}`);
+      path.setAttribute("class", "traceability-tree-edge");
+      path.setAttribute("marker-end", "url(#traceabilityTreeArrow)");
+      svg.appendChild(path);
+    });
+  });
+}
+
+function cssEscape(value) {
+  if (window.CSS?.escape) return window.CSS.escape(value);
+  return String(value).replace(/"/g, "\\\"");
+}
+
 function renderSelectOptions(options, selectedValue, emptyLabel) {
   return `
     <option value="">${emptyLabel}</option>
@@ -630,17 +1075,36 @@ function renderSelectOptions(options, selectedValue, emptyLabel) {
 }
 
 function getResultsSubtitle() {
-  if (traceabilityLoading) return "Consultando historico industrial...";
+  if (traceabilityLoading) return "Consultando histórico industrial...";
   if (!traceabilityResults.length) return "Nenhum lote carregado.";
-  return `${traceabilityResults.length} lote(s) com historico rastreavel.`;
+  return `${traceabilityResults.length} lote(s) com histórico rastreável.`;
 }
 
 function hasAnyFilter() {
   return Object.values(traceabilityFilters).some((value) => String(value || "").trim());
 }
 
+function getTotalConsumed(productions) {
+  return productions.reduce((total, production) => ({
+    quantity: total.quantity + Number(production.quantity || 0),
+    secondaryQuantity: total.secondaryQuantity + Number(production.secondaryQuantity || 0),
+    unit: total.unit || production.unit || "",
+    secondaryUnit: total.secondaryUnit || production.secondaryUnit || ""
+  }), {
+    quantity: 0,
+    secondaryQuantity: 0,
+    unit: "",
+    secondaryUnit: ""
+  });
+}
+
 function normalizeStatus(status) {
-  return status || "Sem status";
+  const labels = {
+    Disponivel: "Disponível",
+    Reprocessavel: "Reprocessável"
+  };
+
+  return labels[status] || status || "Sem status";
 }
 
 function getStatusBadgeClass(status = "") {
@@ -661,6 +1125,7 @@ function getLotCardClass(status = "") {
 
 function getTimelineBadgeClass(type = "") {
   if (type.includes("CANCEL")) return "badge-danger";
+  if (type.includes("LOSS")) return "badge-danger";
   if (type.includes("REPROCESS")) return "badge-info";
   if (type.includes("CONSUMED")) return "badge-warning";
   if (type.includes("OUTPUT") || type.includes("PURCHASE")) return "badge-success";
@@ -669,6 +1134,7 @@ function getTimelineBadgeClass(type = "") {
 
 function getTimelineClass(type = "") {
   if (type.includes("CANCEL")) return "danger";
+  if (type.includes("LOSS")) return "danger";
   if (type.includes("REPROCESS")) return "info";
   if (type.includes("CONSUMED")) return "warning";
   return "success";
@@ -676,13 +1142,15 @@ function getTimelineClass(type = "") {
 
 function getTimelineTypeLabel(type = "") {
   const labels = {
-    LOT_CREATED: "Criacao",
+    LOT_CREATED: "Criação",
     PURCHASE_IN: "Compra",
     PRODUCTION_CONSUMED: "Consumo",
-    PRODUCTION_OUTPUT: "Producao",
+    PRODUCTION_OUTPUT: "Produção",
+    INDUSTRIAL_LOSS: "Perda industrial",
+    PRODUCTION_LOSS: "Perda industrial",
     PRODUCTION_CANCEL: "Cancelamento",
     PRODUCTION_REPROCESS: "Reprocessamento",
-    STOCK_MOVEMENT: "Movimentacao",
+    STOCK_MOVEMENT: "Movimentação",
     LINK_PARENT: "Pai",
     LINK_CHILD: "Filho"
   };
@@ -701,6 +1169,16 @@ function formatSignedNumber(value) {
   const number = Number(value || 0);
   const prefix = number > 0 ? "+" : "";
   return `${prefix}${formatNumber(number)}`;
+}
+
+function formatSignedQuantity(value, unit) {
+  return `${formatSignedNumber(value)}${unit ? ` ${escapeHtml(unit)}` : ""}`;
+}
+
+function formatQuantityWithSecondary(quantity, unit, secondaryQuantity, secondaryUnit) {
+  const primary = `${formatNumber(quantity)}${unit ? ` ${escapeHtml(unit)}` : ""}`;
+  if (!secondaryQuantity || !secondaryUnit) return primary;
+  return `${primary} · Sec.: ${formatNumber(secondaryQuantity)} ${escapeHtml(secondaryUnit)}`;
 }
 
 function formatDate(value) {
