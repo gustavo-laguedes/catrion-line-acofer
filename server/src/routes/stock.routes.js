@@ -1,4 +1,4 @@
-const express = require("express");
+﻿const express = require("express");
 const { query } = require("../db");
 
 const router = express.Router();
@@ -9,6 +9,11 @@ function toNumber(value) {
 
   const number = Number(value);
   return Number.isFinite(number) ? number : 0;
+}
+
+function getPlannedReservedSecondaryQuantity(quantity, secondaryQuantity, plannedReservedQuantity) {
+  if (quantity <= 0 || secondaryQuantity <= 0 || plannedReservedQuantity <= 0) return 0;
+  return secondaryQuantity * (plannedReservedQuantity / quantity);
 }
 
 function getStatusLabel(group) {
@@ -36,6 +41,11 @@ function createEmptyGroup(material) {
     secondaryQuantity: 0,
     reservedQuantity: 0,
     availableQuantity: 0,
+    realAvailableQuantity: 0,
+    plannedReservedQuantity: 0,
+    plannedAvailableQuantity: 0,
+    plannedReservedSecondaryQuantity: 0,
+    plannedAvailableSecondaryQuantity: 0,
     locations: [...locations],
     locationNames: locations.length ? locations.join(" / ") : "-",
     locationBalances: locations.map((locationName) => ({
@@ -44,6 +54,11 @@ function createEmptyGroup(material) {
       secondaryQuantity: 0,
       reservedQuantity: 0,
       availableQuantity: 0,
+      realAvailableQuantity: 0,
+      plannedReservedQuantity: 0,
+      plannedAvailableQuantity: 0,
+      plannedReservedSecondaryQuantity: 0,
+      plannedAvailableSecondaryQuantity: 0,
       status: "Sem saldo"
     })),
     statusLabel: "Sem saldo"
@@ -107,6 +122,7 @@ router.get("/available-lots", async (req, res) => {
           lots.status as "lotStatus",
           sb.quantity,
           sb.secondary_quantity as "secondaryQuantity",
+          coalesce(res.reserved_quantity, 0) as "reservedQuantity",
           sb.unit,
           sb.secondary_unit as "secondaryUnit",
           sb.status as "balanceStatus",
@@ -115,6 +131,15 @@ router.get("/available-lots", async (req, res) => {
         join materials m on m.id = sb.material_id
         join locations loc on loc.id = sb.location_id
         join lots on lots.id = sb.lot_id
+        left join (
+          select
+            lot_id,
+            location_id,
+            sum(quantity) as reserved_quantity
+          from planning_stock_reservations
+          where status in ('Planejada', 'Confirmada')
+          group by lot_id, location_id
+        ) res on res.lot_id = sb.lot_id and res.location_id = sb.location_id
         where ${filters.join("\n          and ")}
         order by lots.production_date asc nulls last, lots.created_at asc nulls last, lots.lot_code asc;
       `,
@@ -124,6 +149,10 @@ router.get("/available-lots", async (req, res) => {
     return res.json(result.rows.map((lot) => {
       const quantity = toNumber(lot.quantity);
       const secondaryQuantity = toNumber(lot.secondaryQuantity);
+      const reservedQuantity = toNumber(lot.reservedQuantity);
+      const plannedReservedSecondaryQuantity = getPlannedReservedSecondaryQuantity(quantity, secondaryQuantity, reservedQuantity);
+      const plannedAvailableQuantity = Math.max(0, quantity - reservedQuantity);
+      const plannedAvailableSecondaryQuantity = Math.max(0, secondaryQuantity - plannedReservedSecondaryQuantity);
 
       return {
         id: lot.lotId,
@@ -140,9 +169,15 @@ router.get("/available-lots", async (req, res) => {
         createdAt: lot.createdAt,
         quantity,
         secondaryQuantity,
-        reservedQuantity: 0,
+        reservedQuantity,
         availableQuantity: quantity,
+        realAvailableQuantity: quantity,
+        plannedReservedQuantity: reservedQuantity,
+        plannedAvailableQuantity,
         availableSecondaryQuantity: secondaryQuantity,
+        realAvailableSecondaryQuantity: secondaryQuantity,
+        plannedReservedSecondaryQuantity,
+        plannedAvailableSecondaryQuantity,
         unit: lot.unit || lot.materialUnit || "-",
         secondaryUnit: lot.secondaryUnit || lot.materialSecondaryUnit || "",
         status: lot.lotStatus || lot.balanceStatus || "Disponivel",
@@ -199,6 +234,7 @@ router.get("/", async (req, res) => {
         lots.status as "lotStatus",
         sb.quantity,
         sb.secondary_quantity as "secondaryQuantity",
+        coalesce(res.reserved_quantity, 0) as "reservedQuantity",
         sb.unit,
         sb.secondary_unit as "secondaryUnit",
         sb.status as "balanceStatus",
@@ -208,6 +244,15 @@ router.get("/", async (req, res) => {
       left join material_types mt on mt.id = m.material_type_id
       join locations loc on loc.id = sb.location_id
       join lots on lots.id = sb.lot_id
+      left join (
+        select
+          lot_id,
+          location_id,
+          sum(quantity) as reserved_quantity
+        from planning_stock_reservations
+        where status in ('Planejada', 'Confirmada')
+        group by lot_id, location_id
+      ) res on res.lot_id = sb.lot_id and res.location_id = sb.location_id
       where m.status = 'Ativo'
         and sb.quantity > 0
         and coalesce(lots.status, 'Disponivel') in ('Disponivel', 'Disponível', 'Ativo')
@@ -226,8 +271,10 @@ router.get("/", async (req, res) => {
       const materialId = balance.materialId;
       const quantity = toNumber(balance.quantity);
       const secondaryQuantity = toNumber(balance.secondaryQuantity);
-      const reservedQuantity = 0;
-      const availableQuantity = quantity - reservedQuantity;
+      const reservedQuantity = toNumber(balance.reservedQuantity);
+      const plannedReservedSecondaryQuantity = getPlannedReservedSecondaryQuantity(quantity, secondaryQuantity, reservedQuantity);
+      const plannedAvailableQuantity = Math.max(0, quantity - reservedQuantity);
+      const plannedAvailableSecondaryQuantity = Math.max(0, secondaryQuantity - plannedReservedSecondaryQuantity);
 
       if (!groupsByMaterial.has(materialId)) {
         groupsByMaterial.set(materialId, createEmptyGroup({
@@ -258,6 +305,11 @@ router.get("/", async (req, res) => {
           secondaryQuantity: 0,
           reservedQuantity: 0,
           availableQuantity: 0,
+          realAvailableQuantity: 0,
+          plannedReservedQuantity: 0,
+          plannedAvailableQuantity: 0,
+          plannedReservedSecondaryQuantity: 0,
+          plannedAvailableSecondaryQuantity: 0,
           status: balance.balanceStatus || "Disponivel"
         };
         group.locationBalances.push(locationBalance);
@@ -266,13 +318,23 @@ router.get("/", async (req, res) => {
       locationBalance.quantity += quantity;
       locationBalance.secondaryQuantity += secondaryQuantity;
       locationBalance.reservedQuantity += reservedQuantity;
-      locationBalance.availableQuantity += availableQuantity;
+      locationBalance.availableQuantity += quantity;
+      locationBalance.realAvailableQuantity += quantity;
+      locationBalance.plannedReservedQuantity += reservedQuantity;
+      locationBalance.plannedAvailableQuantity += plannedAvailableQuantity;
+      locationBalance.plannedReservedSecondaryQuantity += plannedReservedSecondaryQuantity;
+      locationBalance.plannedAvailableSecondaryQuantity += plannedAvailableSecondaryQuantity;
       locationBalance.status = balance.balanceStatus || locationBalance.status;
 
       group.quantity += quantity;
       group.secondaryQuantity += secondaryQuantity;
       group.reservedQuantity += reservedQuantity;
-      group.availableQuantity += availableQuantity;
+      group.availableQuantity += quantity;
+      group.realAvailableQuantity += quantity;
+      group.plannedReservedQuantity += reservedQuantity;
+      group.plannedAvailableQuantity += plannedAvailableQuantity;
+      group.plannedReservedSecondaryQuantity += plannedReservedSecondaryQuantity;
+      group.plannedAvailableSecondaryQuantity += plannedAvailableSecondaryQuantity;
 
       lots.push({
         id: balance.lotId,
@@ -289,7 +351,12 @@ router.get("/", async (req, res) => {
         quantity,
         secondaryQuantity,
         reservedQuantity,
-        availableQuantity,
+        availableQuantity: quantity,
+        realAvailableQuantity: quantity,
+        plannedReservedQuantity: reservedQuantity,
+        plannedAvailableQuantity,
+        plannedReservedSecondaryQuantity,
+        plannedAvailableSecondaryQuantity,
         unit: balance.unit || balance.materialUnit || "-",
         secondaryUnit: balance.secondaryUnit || balance.materialSecondaryUnit || "",
         status: balance.lotStatus || balance.balanceStatus || "Disponivel",
@@ -312,3 +379,4 @@ router.get("/", async (req, res) => {
 });
 
 module.exports = router;
+

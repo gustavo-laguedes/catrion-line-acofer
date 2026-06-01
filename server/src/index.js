@@ -19,6 +19,7 @@ const expeditionVehiclesRoutes = require("./routes/expedition-vehicles.routes");
 const expeditionMaterialParametersRoutes = require("./routes/expedition-material-parameters.routes");
 const traceabilityRoutes = require("./routes/traceability.routes");
 const laboratoryRoutes = require("./routes/laboratory.routes");
+const planningRoutes = require("./routes/planning.routes");
 
 dotenv.config();
 
@@ -47,6 +48,7 @@ app.use("/api/expedition-vehicles", expeditionVehiclesRoutes);
 app.use("/api/expedition-material-parameters", expeditionMaterialParametersRoutes);
 app.use("/api/traceability", traceabilityRoutes);
 app.use("/api/laboratory", laboratoryRoutes);
+app.use("/api/planning", planningRoutes);
 
 app.listen(port, () => {
   console.log(`Catrion Line API running on http://localhost:${port}`);
